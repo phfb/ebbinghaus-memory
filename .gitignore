@@ -1,1 +1,50 @@
-# placeholder
+# ── 依赖 / 构建产物 ────────────────────────────────────────────
+# 本插件零运行时依赖、零构建步骤；这几条只为防止误提交。
+node_modules/
+.pnpm-store/
+dist/
+*.tsbuildinfo
+
+# ── 记忆库：这是用户的私人记忆，永远不进仓库 ──────────────────────
+# 库目录默认是 $DSH_HOME/ebbinghaus-memory/，但有人会 --dir 到项目目录里。
+# 下面按文件名兜底拦住，哪怕库就建在仓库根目录也漏不出去。
+meta.json
+settings.json
+dedup-state.json
+short.jsonl
+long.jsonl
+permanent.jsonl
+*.dshpack
+*.dshpack.enc
+/exports/
+_archive/
+_exports/
+_backup-*/
+_backup-*/
+
+# ── 那个经典的坑：schemastery .volatile() 把 dataDir 包成对象 ──────
+# 结果记忆库被写进一个叫 "[object Object]" 的目录，全程无报错。
+[object Object]/
+
+# ── 迁移用的旧档案 / 人格快照（含真实用户数据）──────────────────
+persona.md
+relationship.json
+USER-PROFILE.md
+日记.md
+
+# ── 开发期临时产物 ────────────────────────────────────────────
+*.debug.log
+.debug/
+.verify-*
+*.verify-*
+验证*/
+temp/
+tmp/
+
+# ── 编辑器 / 系统 ─────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp

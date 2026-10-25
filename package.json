@@ -1,0 +1,67 @@
+{
+  "name": "ebbinghaus-memory",
+  "version": "0.1.0",
+  "description": "按艾宾浩斯遗忘曲线组织的三分区记忆：短期 / 长期 / 永久，到期升级、超容压缩、按需检索。",
+  "type": "module",
+  "license": "MIT",
+  "author": "phfb (https://github.com/phfb)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phfb/ebbinghaus-memory.git"
+  },
+  "homepage": "https://github.com/phfb/ebbinghaus-memory#readme",
+  "bugs": {
+    "url": "https://github.com/phfb/ebbinghaus-memory/issues"
+  },
+  "exports": {
+    ".": "./src/host/index.mjs",
+    "./client": "./src/client/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "SPEC.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc.2"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node tools/check-patch-yaml.mjs",
+    "smoke": "node tools/smoke-cordis.mjs",
+    "migrate": "node tools/migrate.mjs",
+    "preview": "node tools/preview-injection.mjs",
+    "dedup": "node tools/dedup.mjs",
+    "export": "node tools/export.mjs",
+    "import": "node tools/import.mjs",
+    "restore": "node tools/restore.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "ebbinghaus",
+    "forgetting-curve",
+    "spaced-repetition",
+    "agent-memory",
+    "llm-memory"
+  ]
+}

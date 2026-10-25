@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        node: ['22', '24']
+        include:
+          # Windows 是插件的主要使用环境（DSH Desktop），单独跑一遍兜住路径分隔符的问题
+          - os: windows-latest
+            node: '22'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 单元测试（node --test）
+        run: node --test
+
+      - name: 校验 cordis.patch.yml
+        run: node tools/check-patch-yaml.mjs
+
+  lint-shape:
+    name: 零依赖 / 零构建 守住
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 不许出现 dependencies
+        shell: bash
+        run: |
+          node -e "
+          const pkg = require('./package.json');
+          const bad = [];
+          if (pkg.dependencies && Object.keys(pkg.dependencies).length) bad.push('dependencies: ' + Object.keys(pkg.dependencies).join(', '));
+          if (pkg.devDependencies && Object.keys(pkg.devDependencies).length) bad.push('devDependencies: ' + Object.keys(pkg.devDependencies).join(', '));
+          const allowedPeers = ['@deepseek-ai/cordis'];
+          for (const k of Object.keys(pkg.peerDependencies || {})) {
+            if (!allowedPeers.includes(k)) bad.push('peerDependencies 只允许 @deepseek-ai/cordis，多了: ' + k);
+          }
+          if (bad.length) { console.error('✗ ' + bad.join('\n✗ ')); process.exit(1); }
+          console.log('✓ 零运行时依赖、零构建步骤');
+          "
+
+      - name: 源文件里不许静态 import DSH 内部包
+        shell: bash
+        run: |
+          if grep -rnE "^\s*import .*from ['\"]@deepseek-ai/dsh-" src/ ; then
+            echo "✗ src/ 里出现了对 @deepseek-ai/dsh-* 的静态 import —— 解析不到就整个插件加载失败"
+            exit 1
+          fi
+          echo "✓ src/ 没有静态 import DSH 内部包"
+
+      - name: 不许有记忆库数据混进仓库
+        shell: bash
+        run: |
+          bad=$(git ls-files | grep -Ei '(^|/)(short|long|permanent)\.jsonl$|(^|/)(meta|settings|dedup-state)\.json$|(^|/)_archive/|(^|/)_exports/|(^|/)_backup-|\[object Object\]' || true)
+          if [ -n "$bad" ]; then
+            echo "✗ 仓库里混进了记忆库数据："
+            echo "$bad"
+            exit 1
+          fi
+          echo "✓ 仓库里没有记忆库数据"

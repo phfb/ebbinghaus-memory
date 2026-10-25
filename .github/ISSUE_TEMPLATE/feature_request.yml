@@ -1,0 +1,54 @@
+name: 提个想法
+description: 觉得遗忘曲线哪一步不像人、或者哪个设置项该有
+title: '[想法] '
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        做取舍的时候只有一个标准，抄在这儿：
+
+        > **「这像人的记忆，还是像一个数据库？」** 像数据库的砍掉。
+
+        所以提想法的时候，顺手说一句「这为什么更像人」会很有帮助 ——
+        很多看着合理的功能（比如全量归档、精确时间线、跨区全文搜索）就是被这一条挡下来的。
+
+  - type: textarea
+    id: scene
+    attributes:
+      label: 你在什么场景下觉得不对
+      description: 具体的、发生过的事比抽象需求有用得多。
+      placeholder: 上周问它一件三周前定下来的事，它说记不清，但那条其实还在长期区里。
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你希望它怎么做
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: 大概落在哪一层
+      options:
+        - 到期判定（7 天 / 28 天）
+        - 权重升降
+        - 压缩（越压越模糊）
+        - 注入预算与顺序
+        - 检索 / 召回
+        - 自检去重
+        - 面板 / 设置项
+        - 迁移 / 导入导出
+        - 文档
+        - 说不好
+
+  - type: checkboxes
+    id: human
+    attributes:
+      label: 自查
+      options:
+        - label: 这件事让它更像「记得你」，而不是更像「存了数据」
+        - label: 不会让每轮注入变贵（或者你愿意为它变贵）

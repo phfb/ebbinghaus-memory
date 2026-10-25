@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 装法 / 设置项 / 排错
+    url: https://github.com/phfb/ebbinghaus-memory#readme
+    about: README 里有装法、全部设置项、容量与 token 开销的账、排错顺序。先看这里。
+  - name: 接口契约（改代码之前）
+    url: https://github.com/phfb/ebbinghaus-memory/blob/main/SPEC.md
+    about: SPEC.md 是唯一基准：冻结的签名、磁盘布局、注入格式、禁令清单。
