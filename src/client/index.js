@@ -92,6 +92,28 @@ window.__ModuleLoader__.load({
     ];
 
     /**
+     * 镜像状态一句话。没开 / 目录不对 / 正常，三种说法分开写。
+     * @param {any} m
+     * @returns {string}
+     */
+    function mirrorLineText(m) {
+      if (!m || typeof m !== 'object') return '';
+      if (!m.enabled) return '自动备份镜像：关着（在上面那组里打开开关、填好目录才会自动同步）';
+      if (!m.dirOk) return `自动备份镜像：目录还不能用 —— ${m.dirReason || '还没填目录'}`;
+      const parts = [`自动备份镜像：每 ${num(m.every, 5)} 条同步一次`];
+      parts.push(`待同步 ${num(m.pending, 0)} 条`);
+      if (m.lastAt) {
+        const when = String(m.lastAt).replace('T', ' ').slice(0, 19);
+        parts.push(`上次 ${when}${m.lastOk === false ? `（失败：${m.lastError || '原因不明'}）` : ''}`);
+      } else {
+        parts.push('还没同步过');
+      }
+      if (num(m.lastFiles, 0) > 0) parts.push(`上次 ${num(m.lastFiles, 0)} 个文件`);
+      return parts.join(' · ');
+    }
+
+
+    /**
      * token 开销说明。用户点名要的：让他自己看着选，而不是插件替他决定。
      * 三条都必须留着 —— 少一条就会有人以为「库大了每轮都多花钱」。
      */
@@ -1015,6 +1037,16 @@ window.__ModuleLoader__.load({
                   { type: 'button', onClick: props.onReclaim, style: chipStyle(C.text2, busy), disabled: busy },
                   '按总量回收一次',
                 ),
+                h(
+                  'button',
+                  { type: 'button', onClick: props.onMirror, style: chipStyle(C.text2, busy === '镜像'), disabled: busy },
+                  busy === '镜像' ? '同步中…' : '立即同步镜像',
+                ),
+                h(
+                  'p',
+                  { style: { margin: '10px 0 0', fontSize: 11, color: C.text2, lineHeight: 1.7 } },
+                  mirrorLineText(props.mirror),
+                ),
               ),
               notice
                 ? h(
@@ -1168,6 +1200,14 @@ window.__ModuleLoader__.load({
             body[key] = raw === true || raw === 'true';
             continue;
           }
+          // 字符串字段（镜像目录 / 额外路径）：值本来就是文本，路径过 Number()
+          // 必然是 NaN，会被当成「填错了」把整次保存吞掉。而且这一格**空串是
+          // 有意义的**（"留空 = 不备份"），所以空也要提交 —— 只有数字字段才把
+          // 空当"没动"。
+          if (field && field.type === 'string') {
+            body[key] = String(raw ?? '').trim();
+            continue;
+          }
           const s = String(raw ?? '').trim();
           // 空 = 这一项没动。**不能按 0 提交** —— 那会被钳到最小值。
           if (s === '') continue;
@@ -1274,6 +1314,28 @@ window.__ModuleLoader__.load({
           });
       }
 
+      /**
+       * 「立即同步镜像」—— 手动跑一次全量镜像。
+       * 结果写进设置卡的 notice 里（和「保存」共用一行提示，省一块 UI）。
+       */
+      function runMirror() {
+        setBusy('镜像');
+        postJson('/mirror', {})
+          .then((r) => {
+            setBusy('');
+            if (r && r.ok) {
+              const mb = num(r.bytes, 0) / 1048576;
+              setSettingsNotice(`已同步 ${num(r.files, 0)} 项（${mb.toFixed(1)} MB）→ ${r.dir || ''}`);
+            } else {
+              setSettingsNotice(`镜像没成功：${String((r && r.reason) || '未知原因')}`);
+            }
+            reload();
+          })
+          .catch((err) => {
+            setBusy('');
+            setSettingsNotice(`镜像没成功：${String((err && err.message) || err)}`);
+          });
+      }
       function submit() {
         const q = draft.trim();
         setQuery(q);
@@ -1622,6 +1684,8 @@ window.__ModuleLoader__.load({
             onSave: saveSettings,
             onReset: resetSettings,
             onReclaim: reclaimTotal,
+            onMirror: runMirror,
+            mirror: isObj(d.mirror) ? d.mirror : null,
           }),
 
           body,

@@ -466,7 +466,7 @@ test('固化失败时 memory_stats 能说出原因（不是静默）', async (t)
 
 /* ───────────────────────── 3. HTTP 路由 ───────────────────────── */
 
-test('八个 HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
+test('HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
   const dir = await tempDir();
   t.after(() => rm(dir, { recursive: true, force: true }));
 
@@ -492,6 +492,7 @@ test('八个 HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
     '/ebbinghaus/export',
     '/ebbinghaus/forget',
     '/ebbinghaus/harvest',
+    '/ebbinghaus/mirror',
     '/ebbinghaus/reclaim',
     '/ebbinghaus/reload',
     '/ebbinghaus/settings',

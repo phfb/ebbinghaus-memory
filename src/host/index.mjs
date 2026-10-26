@@ -2342,6 +2342,20 @@ export function apply(ctx, rawConfig) {
         },
         {
           kind: 'exact',
+          path: `${PANEL_BASE}/mirror`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              await loadPromise;
+              const r = await runMirrorNow('manual');
+              return reply(res, 200, { ...r, mirror: mirrorPanelState() });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          kind: 'exact',
           path: `${PANEL_BASE}/dedup`,
           handler: async (req, res) => {
             try {
