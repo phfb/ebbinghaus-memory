@@ -540,10 +540,61 @@ export function apply(ctx, rawConfig) {
       // logger 坏了不影响功能
     }
   };
-  /** 面板当前生效的覆盖值（跟 settings.json 内容一致） */
-  let settingsOverrides = readSettingsOverrides(dataDir, earlyWarn);
-  /** 生效配置。**`let`**：面板改设置时要整体换一份。 */
-  let config = applyOverrides(baseConfig, settingsOverrides).config;
+  /** 当前激活的分区 id（运行时真值；spaces.json 里的 active 只是持久化副本）。 */
+  let activeSpaceId = spaceInfo.activeId;
+  /** 当前正在操作的分区：串行任务 / 渲染期间临时设置；null = 跟随激活分区。 */
+  let opSpaceId = null;
+  /**
+   * 每个分区一份「面板拧过的旋钮」（存在各自目录的 settings.json 里）。
+   *
+   * 这就是「记忆形状类参数每分区独立」的实现：白名单（TUNABLE_KEYS）里的键按分区覆盖，
+   * 白名单外的（provider / model / maxTokens / enabled / dataDir…）永远来自 baseConfig，
+   * 也就是全局共用 —— 正好是用户定的口径。
+   */
+  const settingsPool = new Map();
+  /** 每个分区算出来的生效配置。 */
+  const configPool = new Map();
+
+  /** 某个分区的覆盖层（懒读一次）。 */
+  function overridesOf(spaceId) {
+    const sid = String(spaceId || activeSpaceId);
+    let ov = settingsPool.get(sid);
+    if (ov === undefined) {
+      const dir = sid === activeSpaceId ? dataDir : spaceDirOf(libraryRoot, sid);
+      ov = readSettingsOverrides(dir, earlyWarn);
+      settingsPool.set(sid, ov);
+    }
+    return ov;
+  }
+
+  /** 当前激活分区的覆盖层（面板读写用）。 */
+  function overridesNow() {
+    return overridesOf(activeSpaceId);
+  }
+
+  /** 某个分区的生效配置。 */
+  function configOf(spaceId) {
+    const sid = String(spaceId || activeSpaceId);
+    let c = configPool.get(sid);
+    if (c === undefined) {
+      c = applyOverrides(baseConfig, overridesOf(sid)).config;
+      configPool.set(sid, c);
+    }
+    return c;
+  }
+
+  /**
+   * 全局 `config` 也是**代理**：读「当前操作分区」那份。
+   * 和 store 一个套路 —— 渲染 / 固化 / 压缩那几十处 `config.xxx` 不用逐处判断分区。
+   */
+  const config = new Proxy({}, {
+    get(_target, prop) {
+      return configOf(opSpaceId ?? activeSpaceId)[prop];
+    },
+    has(_target, prop) {
+      return prop in configOf(opSpaceId ?? activeSpaceId);
+    },
+  });
   /**
    * 自检进度。**必须落盘**：只存内存的话每次重启都归零，
    * 「每 30 条自检一次」会变成「每 30 条，或者每次重开 DSH 后第一次写记忆」。
@@ -597,10 +648,6 @@ export function apply(ctx, rawConfig) {
 
   /* ── 记忆库 ── */
 
-  /** 当前激活的分区 id（运行时真值；spaces.json 里的 active 只是持久化副本）。 */
-  let activeSpaceId = spaceInfo.activeId;
-  /** 当前正在操作的分区：串行任务 / 渲染期间临时设置；null = 跟随激活分区。 */
-  let opSpaceId = null;
 
   /** 每个分区的真 store（激活分区那份也在这里，保证始终是同一个对象）。 */
   /** @type {Map<string, any>} */
@@ -2317,13 +2364,13 @@ export function apply(ctx, rawConfig) {
    * @returns {object}
    */
   function settingsSnapshot() {
-    const fields = tunableFields(config, settingsOverrides);
+    const fields = tunableFields(config, overridesNow());
     /** @type {Record<string, any>} */
     const baseValues = {};
     for (const f of fields) baseValues[f.key] = baseConfig?.[f.key] ?? f.default;
     return {
       file: settingsPathOf(dataDir),
-      overridden: Object.keys(settingsOverrides).length > 0,
+      overridden: Object.keys(overridesNow()).length > 0,
       fields,
       baseValues,
     };
@@ -2347,7 +2394,7 @@ export function apply(ctx, rawConfig) {
   function updateSettings(body) {
     const wantsReset = body?.reset === true;
     /** @type {Record<string, any>} */
-    let next = wantsReset ? {} : { ...settingsOverrides };
+    let next = wantsReset ? {} : { ...overridesNow() };
     /** 传了但不在白名单里的键 —— 要如实回一句「这个我不管」 */
     /** @type {string[]} */
     const extraRejected = [];
@@ -2369,8 +2416,8 @@ export function apply(ctx, rawConfig) {
     // 直接删掉的话它会掉回底座默认值：用户手滑传了个 "abc"，容量从 300
     // 变成默认的 120，看起来像「设置自己重置了」。
     for (const key of applied.rejected) {
-      if (Object.prototype.hasOwnProperty.call(settingsOverrides, key)) {
-        next[key] = settingsOverrides[key];
+      if (Object.prototype.hasOwnProperty.call(overridesNow(), key)) {
+        next[key] = overridesNow()[key];
       } else {
         delete next[key];
       }
@@ -2395,8 +2442,8 @@ export function apply(ctx, rawConfig) {
     }
 
     // ② 内存
-    settingsOverrides = next;
-    config = finalConfig;
+    settingsPool.set(activeSpaceId, next);
+    configPool.set(activeSpaceId, finalConfig);
     invalidateAllRenders();
 
     const now = Date.now();

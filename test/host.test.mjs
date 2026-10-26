@@ -1545,3 +1545,90 @@ test('分区管理：新建超过 10 个会被拒', async (t) => {
   assert.equal(over.status, 400);
   assert.match(String(over.body.error), /10/);
 });
+
+/* ─────────────────── 配置分层：每个分区各用各的设置 ─────────────────── */
+
+/** 读一次 /state。 */
+async function getState(h) {
+  const route = h.route('/ebbinghaus/state');
+  const res = fakeRes();
+  await route.handler(fakeReq({ url: '/ebbinghaus/state' }), res);
+  return res.json();
+}
+
+/** /state.settings.fields 里某个键的当前值。 */
+function fieldValue(state, key) {
+  const fields = state && state.settings && Array.isArray(state.settings.fields) ? state.settings.fields : [];
+  const f = fields.find((x) => x && x.key === key);
+  return f ? f.value : undefined;
+}
+
+test('配置分层：两个分区各用各自的 settings.json', async (t) => {
+  const dir = await tempDir();
+  t.after(async () => {
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄没释放
+    }
+  });
+  makeTwoSpaces(dir);
+
+  // 两个分区各自拧了不同的短期容量
+  writeFileSync(path.join(dir, 'spaces', 'private', 'settings.json'), JSON.stringify({ shortCapacity: 200 }), 'utf8');
+  writeFileSync(path.join(dir, 'spaces', 'work', 'settings.json'), JSON.stringify({ shortCapacity: 500 }), 'utf8');
+
+  const llm = makeLlm({ text: modelJson([]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const s1 = await getState(h);
+  assert.equal(s1.spaces.active, 'private');
+  assert.equal(fieldValue(s1, 'shortCapacity'), 200, '私生活应当用自己的 200');
+
+  const switched = await callPost(h, '/ebbinghaus/spaces/active', { id: 'work' });
+  assert.equal(switched.body.ok, true);
+
+  const s2 = await getState(h);
+  assert.equal(s2.spaces.active, 'work');
+  assert.equal(fieldValue(s2, 'shortCapacity'), 500, '切到工作之后应当用它的 500');
+
+  // 全局键（不在面板白名单里）永远走底座，不会被分区设置影响
+  assert.equal(typeof s2.settings.baseValues, 'object');
+  const overriddenKeys = (s2.settings.fields || []).filter((f) => f.overridden).map((f) => f.key);
+  assert.deepEqual(overriddenKeys, ['shortCapacity'], '只有那一个键是「面板改过」');
+});
+
+test('配置分层：一个分区改了设置，不影响另一个分区', async (t) => {
+  const dir = await tempDir();
+  t.after(async () => {
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // 同上
+    }
+  });
+  makeTwoSpaces(dir);
+
+  const llm = makeLlm({ text: modelJson([]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const before = fieldValue(await getState(h), 'shortCapacity');
+
+  // 只改当前分区（private）
+  const saved = await callPost(h, '/ebbinghaus/settings', { shortCapacity: 333 });
+  assert.equal(saved.body.ok, true);
+  assert.equal(fieldValue(await getState(h), 'shortCapacity'), 333, '当前分区应当立刻生效');
+
+  // 落盘也只落在 private 的目录里
+  const priv = JSON.parse(readFileSync(path.join(dir, 'spaces', 'private', 'settings.json'), 'utf8'));
+  assert.equal(priv.shortCapacity, 333);
+  assert.equal(existsSync(path.join(dir, 'spaces', 'work', 'settings.json')), false, '另一个分区不该被写文件');
+
+  // 切过去看，work 还是底座默认值
+  await callPost(h, '/ebbinghaus/spaces/active', { id: 'work' });
+  const workVal = fieldValue(await getState(h), 'shortCapacity');
+  assert.notEqual(workVal, 333, 'work 不该被 private 的改动带上');
+  assert.equal(workVal, before, 'work 还是原来的值');
+});
