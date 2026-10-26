@@ -109,6 +109,7 @@ window.__ModuleLoader__.load({
         parts.push('还没同步过');
       }
       if (num(m.lastFiles, 0) > 0) parts.push(`上次 ${num(m.lastFiles, 0)} 个文件`);
+      parts.push('（只同步当前分区）');
       return parts.join(' · ');
     }
 
@@ -1364,7 +1365,11 @@ window.__ModuleLoader__.load({
           .then((r) => {
             setBusy('');
             setSpaceOp(null);
-            if (r && r.ok === false) setSettingsNotice(`分区操作没成功：${r.error || '未知原因'}`);
+            if (r && r.ok === false) {
+              setSettingsNotice(`分区操作没成功：${r.error || '未知原因'}`);
+            } else if (op.mode === 'delete' && num(r.unbound, 0) > 0) {
+              setSettingsNotice(`已删掉，目录搬到 _trash；顺带解绑了 ${num(r.unbound, 0)} 个会话`);
+            }
             reload();
           })
           .catch((err) => {
@@ -1726,11 +1731,21 @@ window.__ModuleLoader__.load({
             if (list.length === 0) return null;
             const cur = list.find((x) => x.id === sp.active) ?? list[0];
             const curName = cur ? cur.name : sp.active;
+            const ago = (iso) => {
+              if (!iso) return '空库';
+              const t = Date.parse(String(iso));
+              if (!Number.isFinite(t)) return '';
+              const min = Math.floor((Date.now() - t) / 60000);
+              if (min < 1) return '刚刚';
+              if (min < 60) return `${min} 分钟前`;
+              if (min < 1440) return `${Math.floor(min / 60)} 小时前`;
+              return `${Math.floor(min / 1440)} 天前`;
+            };
             const fmt = (s) =>
               `${s.name}（短 ${num(s.counts && s.counts.short, 0)} · 长 ${num(s.counts && s.counts.long, 0)} · 永 ${num(
                 s.counts && s.counts.permanent,
                 0,
-              )}）`;
+              )} · ${ago(s.lastActivityAt)}）`;
             return h(
               'div',
               {

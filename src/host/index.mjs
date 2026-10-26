@@ -728,15 +728,26 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** 面板要的分区列表：每个分区的条数、是不是当前这个。 */
+  /** 面板要的分区列表：条数、是不是当前这个、最近一次写是什么时候。 */
   function spacesPanelList() {
     return (spaceInfo.spaces ?? []).map((sp) => {
       const rt = ensureRuntime(sp.id);
+      // 最近活动 = 三个 jsonl 里最新的那个 mtime。空分区就是 null。
+      let lastAt = 0;
+      for (const zone of ZONES) {
+        try {
+          const p = path.join(rt.dir, `${zone}.jsonl`);
+          if (existsSync(p)) lastAt = Math.max(lastAt, statSync(p).mtimeMs);
+        } catch {
+          // 读不到就当我没看见
+        }
+      }
       return {
         id: sp.id,
         name: sp.name,
         createdAt: sp.createdAt,
         active: sp.id === activeSpaceId,
+        lastActivityAt: lastAt > 0 ? new Date(lastAt).toISOString() : null,
         counts: {
           short: rt.store.zones.short.length,
           long: rt.store.zones.long.length,
