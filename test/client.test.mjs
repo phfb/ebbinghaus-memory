@@ -788,6 +788,70 @@ test('client: 输入框里不是数字就不提交，直接在面板上说一句
   assert.equal(calls.filter((c) => c.method === 'POST').length, 0, '坏值不许发出去');
 });
 
+/** 带一个字符串字段（镜像目录）的响应 —— 2026-10-26 那个 「[mirrorDir] 不是数字」 的现场。 */
+const tokenPayloadWithMirrorDir = (value = '') => {
+  const data = tokenPayload();
+  data.settings.fields.push({
+    key: 'mirrorDir',
+    type: 'string',
+    label: '镜像目录（绝对路径；留空 = 不备份）',
+    default: '',
+    value,
+    overridden: false,
+  });
+  return data;
+};
+
+const MIRROR_LABEL = '镜像目录（绝对路径；留空 = 不备份）';
+/** 面板顶部的搜索框也是 input，所以不能按下标找，只能认 aria-label。 */
+const labeled = (tree, label) => findAll(tree, (n) => n.type === 'input' && n.props['aria-label'] === label)[0];
+
+test('client: 镜像目录是字符串字段，填路径照样能保存（不会被"不是数字"挡掉）', async () => {
+  const react = makeStubReact();
+  const { panel, calls } = mount({ react, fetchImpl: okFetch(tokenPayloadWithMirrorDir()) });
+  let tree = await renderSettled(panel, react, 1);
+  tree = await clickAndSettle(panel, react, buttonByText(tree, '展开'));
+
+  const box = labeled(tree, MIRROR_LABEL);
+  assert.ok(box, '字符串字段要渲染成文本框');
+  assert.equal(box.props.type, 'text');
+
+  // 关键：一次保存里混着数字和路径 —— 正是用户踩到的那一下
+  box.props.onChange({ target: { value: 'E:\\DSHmemoryBackup' } });
+  tree = renderNow(panel, react);
+  labeled(tree, '全库总量上限（token，渲染口径，最多 30 万）').props.onChange({ target: { value: '200000' } });
+  tree = renderNow(panel, react);
+
+  tree = await clickAndSettle(panel, react, buttonByText(tree, '保存'));
+
+  assert.ok(!textOf(tree).includes('不是数字'), '路径字段不许把整次保存判成"填错了"');
+  const post = calls.find((c) => c.method === 'POST' && c.url.endsWith('/ebbinghaus/settings'));
+  assert.ok(post, '整次保存不能被路径字段吞掉');
+  const body = JSON.parse(post.body);
+  assert.equal(body.mirrorDir, 'E:\\DSHmemoryBackup', '路径要原样当字符串发出去，不能过 Number()');
+  assert.equal(body.totalTokenCapacity, 200000, '同一批里的数字字段照旧生效');
+});
+
+test('client: 镜像目录清空也要能存下去（"留空 = 不备份"是正式语义）', async () => {
+  const react = makeStubReact();
+  const { panel, calls } = mount({
+    react,
+    fetchImpl: okFetch(tokenPayloadWithMirrorDir('E:\\DSHmemoryBackup')),
+  });
+  let tree = await renderSettled(panel, react, 1);
+  tree = await clickAndSettle(panel, react, buttonByText(tree, '展开'));
+
+  const box = labeled(tree, MIRROR_LABEL);
+  assert.equal(box.props.value, 'E:\\DSHmemoryBackup', '原来的值得显示出来');
+  box.props.onChange({ target: { value: '' } });
+  tree = renderNow(panel, react);
+  tree = await clickAndSettle(panel, react, buttonByText(tree, '保存'));
+
+  const post = calls.find((c) => c.method === 'POST' && c.url.endsWith('/ebbinghaus/settings'));
+  assert.ok(post, '清空也是一次有效改动，得发得出去');
+  assert.deepEqual(JSON.parse(post.body), { mirrorDir: '' }, '空串要提交，不能被当成"这一项没动"');
+});
+
 test('client: 「恢复 DSH 配置」发 reset，不挨个回传旧值', async () => {
   const react = makeStubReact();
   const { panel, calls } = mount({ react, fetchImpl: okFetch(tokenPayload()) });
