@@ -19,7 +19,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { registerHooks } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -228,8 +228,21 @@ function fakeReq({ method = 'GET', url = '/', body } = {}) {
   return req;
 }
 
+/**
+ * 记忆库现在在 `<dataDir>/spaces/<分区id>/` 里（2026-10-26 起支持多主分区）。
+ * 测试里所有「直接摸库文件」的地方都走这个 helper，别再往根目录拼。
+ */
+const libDir = (dir) => {
+  const p = path.join(dir, 'spaces', 'private');
+  try {
+    mkdirSync(p, { recursive: true });
+  } catch {
+    // 建不出来就让后面的写操作自己报错
+  }
+  return p;
+};
 async function readZone(dir, zone) {
-  const file = path.join(dir, `${zone}.jsonl`);
+  const file = path.join(libDir(dir), `${zone}.jsonl`);
   if (!existsSync(file)) return [];
   const text = await readFile(file, 'utf8');
   return text
@@ -332,7 +345,7 @@ test('采集 → 闸门 → 固化 → 落盘 → 渲染注入（整条链）', 
   assert.equal(short[0].session, 'sess-1');
   assert.ok(short[0].ts > 0 && typeof short[0].iso === 'string');
   assert.deepEqual(short[0].keywords.slice(0, 3), ['Ebbinghaus', '记忆插件', 'DSH']);
-  assert.ok(existsSync(path.join(dir, 'meta.json')), 'meta.json 要写出来');
+  assert.ok(existsSync(path.join(libDir(dir), 'meta.json')), 'meta.json 要写出来');
   // 另外两区也应该是空文件（原子写，不会半截）
   assert.equal((await readZone(dir, 'long')).length, 0);
   assert.equal((await readZone(dir, 'permanent')).length, 0);
@@ -512,7 +525,7 @@ test('HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
   assert.equal(state.ok, true);
   assert.equal(state.ready, true);
   assert.equal(state.degraded, false);
-  assert.equal(state.dir, dir);
+  assert.equal(state.dir, libDir(dir));
   assert.equal(state.query, 'Ebbinghaus');
   assert.equal(state.total, 1);
   assert.equal(state.hits.length, 1, '?q= 要走检索');
@@ -624,7 +637,7 @@ test('解析失败整批丢弃', async (t) => {
   assert.equal((await readZone(dir, 'short')).length, 0, '解析失败 → 一条都不写');
   // 库骨架在首次 load 时就建好了（这是特性，不是「写入了记忆」）：
   // 「没有写入」该验的是「分区里没有条目」，不是「磁盘上一个文件都没有」。
-  assert.ok(existsSync(path.join(dir, 'meta.json')), '首次运行就该把库骨架建出来');
+  assert.ok(existsSync(path.join(libDir(dir), 'meta.json')), '首次运行就该把库骨架建出来');
   for (const zone of ['short', 'long', 'permanent']) {
     assert.equal((await readZone(dir, zone)).length, 0, `解析失败时 ${zone} 不该有条目`);
   }
@@ -674,7 +687,7 @@ test('finish.kind = max-tokens / error 一律不写盘', async (t) => {  const n
 
       const short = await readZone(dir, 'short');
       assert.equal(short.length, 0, `finish=${kind} 时不该有任何条目落盘`);
-      assert.ok(existsSync(path.join(dir, 'meta.json')), '骨架照建，只是不落任何条目');
+      assert.ok(existsSync(path.join(libDir(dir), 'meta.json')), '骨架照建，只是不落任何条目');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -902,7 +915,7 @@ test('命中多条时先列候选，用户点名后只读那一条（检索式�
 
   // 预置三条都跟「桌宠」有关的记忆
   const now = Date.now();
-  const store = createStore({ dir, log: () => {}, warn: () => {} });
+  const store = createStore({ dir: libDir(dir), log: () => {}, warn: () => {} });
   await store.load();
   const mkEntry = (days, title, detail) =>
     normalizeEntry(
@@ -1033,7 +1046,7 @@ test('面板设置：改容量当场生效、落 settings.json、白名单外拒
   assert.equal(p.ok, true);
   assert.deepEqual([...p.accepted].sort(), ['shortCapacity', 'totalTokenCapacity']);
 
-  const file = path.join(dir, 'settings.json');
+  const file = path.join(libDir(dir), 'settings.json');
   assert.equal(existsSync(file), true, '要落盘 —— 否则重启就丢');
   const onDisk = JSON.parse(await readFile(file, 'utf8'));
   assert.equal(onDisk.shortCapacity, 300);
@@ -1058,7 +1071,7 @@ test('面板设置：改容量当场生效、落 settings.json、白名单外拒
   const resState2 = fakeRes();
   await h.route('/ebbinghaus/state').handler(fakeReq({ url: '/ebbinghaus/state' }), resState2);
   assert.equal(resState2.json().zones.short.max, 300, '坏值不许把值打回默认');
-  assert.equal(resState2.json().dir, dir, 'dataDir 不许被面板改掉');
+  assert.equal(resState2.json().dir, libDir(dir), 'dataDir 不许被面板改掉');
 
   // ── 越界钳制 ──
   const resClamp = fakeRes();
@@ -1090,7 +1103,7 @@ test('全库总量：超上限时按最不重要的回收，原文进 _archive',
 
   // 预置 50 条又长又老的短期记忆，把总量顶到上限以上
   const now = Date.now();
-  const store = createStore({ dir, log: () => {}, warn: () => {} });
+  const store = createStore({ dir: libDir(dir), log: () => {}, warn: () => {} });
   await store.load();
   for (let i = 0; i < 50; i += 1) {
     const e = normalizeEntry(
@@ -1128,7 +1141,7 @@ test('全库总量：超上限时按最不重要的回收，原文进 _archive',
   assert.ok(after.total <= 5000, `压完要在上限内：${after.total}`);
 
   // 原文进了 _archive（压缩不可逆，必须留底）
-  assert.equal(existsSync(path.join(dir, '_archive', 'compressed.jsonl')), true);
+  assert.equal(existsSync(path.join(libDir(dir), '_archive', 'compressed.jsonl')), true);
 });
 
 test('全库总量：剩下的全是人格底色时不再硬压，如实报 exhausted', async (t) => {
@@ -1136,7 +1149,7 @@ test('全库总量：剩下的全是人格底色时不再硬压，如实报 exha
   t.after(() => rm(dir, { recursive: true, force: true }));
 
   const now = Date.now();
-  const store = createStore({ dir, log: () => {}, warn: () => {} });
+  const store = createStore({ dir: libDir(dir), log: () => {}, warn: () => {} });
   await store.load();
   for (let i = 0; i < 90; i += 1) {
     store.add(
@@ -1173,7 +1186,7 @@ test('全库总量：剩下的全是人格底色时不再硬压，如实报 exha
 /** 预置两条跨分区的重复记忆，返回 store。 */
 async function seedDuplicates(dir) {
   const now = Date.now();
-  const store = createStore({ dir, log: () => {}, warn: () => {} });
+  const store = createStore({ dir: libDir(dir), log: () => {}, warn: () => {} });
   await store.load();
   const body = '对方明确要求不在公众场合念他的名字，答应只在两人独处时才叫。';
   store.add(
@@ -1233,7 +1246,7 @@ test('记忆库自检：跨分区重复合成一条、落最深的区、原文�
   assert.equal(merged.mergedFrom.length, 2);
 
   // 压缩不可逆 —— 原文必须留底
-  assert.equal(existsSync(path.join(dir, '_archive', 'dedup.jsonl')), true);
+  assert.equal(existsSync(path.join(libDir(dir), '_archive', 'dedup.jsonl')), true);
 });
 
 test('记忆库自检：每 N 条自动触发一次，触发后计数清零并落盘', async (t) => {
@@ -1243,7 +1256,7 @@ test('记忆库自检：每 N 条自动触发一次，触发后计数清零并�
 
   // 模拟「已经攒了 29 条」—— 再写 1 条就该到 30
   writeFileSync(
-    path.join(dir, 'dedup-state.json'),
+    path.join(libDir(dir), 'dedup-state.json'),
     JSON.stringify({ entriesSinceCheck: 29, lastCheckAt: 0, totalGroups: 0, totalMerged: 0 }),
     'utf8',
   );
@@ -1262,7 +1275,7 @@ test('记忆库自检：每 N 条自动触发一次，触发后计数清零并�
   h.emit('agent/turn-stopping', { agent });
   await h.services.get('ebbinghausMemory').flush();
 
-  const state = JSON.parse(readFileSync(path.join(dir, 'dedup-state.json'), 'utf8'));
+  const state = JSON.parse(readFileSync(path.join(libDir(dir), 'dedup-state.json'), 'utf8'));
   assert.equal(state.entriesSinceCheck, 0, '跑完就清零');
   assert.ok(state.lastCheckAt > 0, '要记下上次自检时间');
   assert.ok(state.lastGroups >= 1, '应当真的合了一组');
@@ -1287,7 +1300,7 @@ test('记忆库自检：没攒够只记账，不动库', async (t) => {
   h.emit('agent/turn-stopping', { agent });
   await h.services.get('ebbinghausMemory').flush();
 
-  const state = JSON.parse(readFileSync(path.join(dir, 'dedup-state.json'), 'utf8'));
+  const state = JSON.parse(readFileSync(path.join(libDir(dir), 'dedup-state.json'), 'utf8'));
   assert.equal(state.entriesSinceCheck, 1, '只写了 1 条，记账但不动');
   assert.equal(state.lastCheckAt, 0, '没跑过自检');
 
@@ -1302,7 +1315,7 @@ test('记忆库自检：关掉之后不会自动跑，但手动还能跑', async
   t.after(() => rm(dir, { recursive: true, force: true }));
   await seedDuplicates(dir);
 
-  writeFileSync(path.join(dir, 'dedup-state.json'), JSON.stringify({ entriesSinceCheck: 99 }), 'utf8');
+  writeFileSync(path.join(libDir(dir), 'dedup-state.json'), JSON.stringify({ entriesSinceCheck: 99 }), 'utf8');
 
   const now = Date.now();
   const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '又一条')]) });

@@ -55,6 +55,19 @@ import {
   shouldSkipName,
 } from '../core/mirror.mjs';
 import { createStore } from '../core/store.mjs';
+import {
+  DEFAULT_SPACE_ID,
+  DEFAULT_SPACE_NAME,
+  LEGACY_LIB_DIRS,
+  REGISTRY_FILE,
+  SPACES_DIR,
+  emptyRegistry,
+  findSpace,
+  parseRegistry,
+  planLegacyMigration,
+  spaceDirOf,
+  verifyMigration,
+} from '../core/spaces.mjs';
 import { ZONE_LABEL, ZONES, normalizeEntry } from '../core/schema.mjs';
 import { expiryOverview, fullStamp, relativeStamp, stampFor } from '../core/time.mjs';
 import { harvest, initialZoneFor, isOverCapacity, digestDropped } from '../core/zones.mjs';
@@ -186,6 +199,148 @@ function resolveDataDir(config) {
   const explicit = raw.includes('[object Object]') ? '' : raw;
   return explicit !== '' ? path.resolve(explicit) : path.join(dshHome(), 'ebbinghaus-memory');
 }
+
+/** 数一个 jsonl 有几条（迁移校验用）。 */
+function countJsonlLines(file) {
+  try {
+    return readFileSync(file, 'utf8').split('\n').filter((s) => s.trim() !== '').length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 保证库根下有分区结构，必要时把「根目录里的老库」搬进默认分区。
+ *
+ * 三条纪律：
+ *  1. **先复制、校验条数、才删原件** —— 任何一步不对就回滚，老库一个字节都不动。
+ *  2. 校验失败不抛错，退回「直接用根目录当库」（降级模式），插件照常能用。
+ *  3. 全新库也走 spaces/ 结构，不做特例 —— 否则以后每次判断都要分叉。
+ *
+ * @param {string} root 库根（配置里的 dataDir）
+ * @param {(m:string)=>void} [log]
+ * @param {(m:string)=>void} [warn]
+ */
+function ensureSpaces(root, log = () => {}, warn = () => {}) {
+  /** @type {any} */
+  const out = {
+    activeId: DEFAULT_SPACE_ID,
+    activeName: DEFAULT_SPACE_NAME,
+    spaceDir: root,
+    spaces: [],
+    migrated: false,
+    degraded: false,
+    problems: [],
+  };
+  try {
+    mkdirSync(root, { recursive: true });
+    const spacesRoot = path.join(root, SPACES_DIR);
+    const hasSpacesDir = existsSync(spacesRoot);
+    let rootFiles = [];
+    try {
+      rootFiles = readdirSync(root, { withFileTypes: true })
+        .filter((e) => e.isFile())
+        .map((e) => e.name);
+    } catch {
+      rootFiles = [];
+    }
+
+    // ── ① 老库迁移 ──
+    const targetDir = spaceDirOf(root, DEFAULT_SPACE_ID);
+    const plan = planLegacyMigration({
+      rootHasSpacesDir: hasSpacesDir,
+      rootFiles,
+      targetDirExists: existsSync(targetDir),
+    });
+    if (plan.needed) {
+      const expect = {
+        short: countJsonlLines(path.join(root, 'short.jsonl')),
+        long: countJsonlLines(path.join(root, 'long.jsonl')),
+        permanent: countJsonlLines(path.join(root, 'permanent.jsonl')),
+      };
+      mkdirSync(targetDir, { recursive: true });
+      for (const name of plan.files) {
+        const from = path.join(root, name);
+        if (existsSync(from)) copyFileSync(from, path.join(targetDir, name));
+      }
+      for (const name of plan.dirs) {
+        const from = path.join(root, name);
+        if (existsSync(from)) cpSync(from, path.join(targetDir, name), { recursive: true, force: true });
+      }
+      const got = {
+        short: countJsonlLines(path.join(targetDir, 'short.jsonl')),
+        long: countJsonlLines(path.join(targetDir, 'long.jsonl')),
+        permanent: countJsonlLines(path.join(targetDir, 'permanent.jsonl')),
+      };
+      const check = verifyMigration(got, expect);
+      if (!check.ok) {
+        try {
+          rmSync(targetDir, { recursive: true, force: true });
+        } catch {
+          // 删不掉也不影响老库
+        }
+        out.degraded = true;
+        out.problems.push(...check.problems);
+        warn(`分区迁移校验没过，已回滚（老库没动）：${check.problems.join('；')}`);
+        return out;
+      }
+      for (const name of plan.files) {
+        try {
+          unlinkSync(path.join(root, name));
+        } catch {
+          // 删不掉就留着，spaces/ 已经存在，下次不会再搬一次
+        }
+      }
+      for (const name of plan.dirs) {
+        try {
+          rmSync(path.join(root, name), { recursive: true, force: true });
+        } catch {
+          // 同上
+        }
+      }
+      out.migrated = true;
+      log(`老库已搬进分区「${DEFAULT_SPACE_NAME}」（${expect.short}/${expect.long}/${expect.permanent} 条）`);
+    }
+
+    // ── ② 注册表 ──
+    const regPath = path.join(root, REGISTRY_FILE);
+    let registry;
+    if (existsSync(regPath)) {
+      try {
+        const parsed = parseRegistry(JSON.parse(readFileSync(regPath, 'utf8')));
+        registry = parsed.registry;
+        out.problems.push(...parsed.problems);
+      } catch (err) {
+        registry = emptyRegistry();
+        out.problems.push(`spaces.json 读不了，按单分区处理：${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      registry = emptyRegistry();
+    }
+
+    // ── ③ 激活分区目录 ──
+    const activeDef = findSpace(registry, registry.active) ?? registry.spaces[0];
+    const dir = spaceDirOf(root, activeDef.id);
+    mkdirSync(dir, { recursive: true });
+    if (!existsSync(regPath)) {
+      writeFileSync(regPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+    }
+
+    out.activeId = activeDef.id;
+    out.activeName = activeDef.name;
+    out.spaceDir = dir;
+    out.spaces = registry.spaces;
+    return out;
+  } catch (err) {
+    out.degraded = true;
+    out.problems.push(`分区初始化失败，退回直接用库根：${err instanceof Error ? err.message : String(err)}`);
+    warn(out.problems[out.problems.length - 1]);
+    return out;
+  }
+}
+/** 仅供单测：分区初始化/迁移。**/
+export const __spacesTest = { ensureSpaces };
+
 
 /* ───────────────── 面板设置的持久化（settings.json 覆盖层） ───────────────── */
 
@@ -357,7 +512,12 @@ export function apply(ctx, rawConfig) {
    */
   const baseConfig = resolveConfig(rawConfig);
   /** 记忆库目录：apply 时一次算定 */
-  const dataDir = resolveDataDir(baseConfig);
+  /** 库根（配置里的 dataDir）：里面放 spaces.json 和 spaces\ 分区目录。 */
+  const libraryRoot = resolveDataDir(baseConfig);
+  /** 分区账本：当前激活哪个、都有哪些、有没有刚搬过家。 */
+  const spaceInfo = ensureSpaces(libraryRoot);
+  /** 当前激活分区的目录 —— 下面几百行里所有的「库目录」指的都是它。 */
+  const dataDir = spaceInfo.spaceDir;
   /**
    * 读覆盖层要赶在 `emit()` 定义之前（`emit` 自己要用 config）。
    * 所以这里用一个只走 ctx.logger 的极简出口 —— 读失败本身就是异常路径，
@@ -379,6 +539,11 @@ export function apply(ctx, rawConfig) {
    * 「每 30 条自检一次」会变成「每 30 条，或者每次重开 DSH 后第一次写记忆」。
    */
   let dedupState = readDedupState(dataDir, earlyWarn);
+
+  /* 分区账本攒下的问题，等 config 初始化完再播报（ensureSpaces 那会儿调 warn 会踩 TDZ）。 */
+  for (const msg of spaceInfo.problems) warn(`分区：${msg}`);
+  if (spaceInfo.migrated) log(`老库已搬进分区「${spaceInfo.activeName}」（${dataDir}）`);
+  if (spaceInfo.degraded) warn('分区初始化降级：仍然直接用库根当记忆库');
 
   /* ── 日志：只打形状，绝不落盘对话正文 ── */
 
@@ -1398,14 +1563,15 @@ export function apply(ctx, rawConfig) {
    */
   async function runMirrorNow(trigger) {
     const dir = String(config.mirrorDir ?? '').trim();
-    const safe = isSafeMirrorDir(dir, dataDir);
+    const safe = isSafeMirrorDir(path.join(path.resolve(dir), spaceInfo.activeId), dataDir);
     if (!safe.ok) {
       mirrorState = { ...mirrorState, lastOk: false, lastError: safe.reason };
       writeMirrorState(dataDir, mirrorState);
       return { ok: false, reason: safe.reason };
     }
 
-    const mir = path.resolve(dir);
+    // 每个分区一个子目录：镜像里也是「多开」，互不覆盖
+    const mir = path.join(path.resolve(dir), spaceInfo.activeId);
     try {
       mkdirSync(mir, { recursive: true });
       for (const sub of ['library', 'dsh', 'extra']) {
@@ -2041,6 +2207,15 @@ export function apply(ctx, rawConfig) {
       ready,
       degraded,
       dir: dataDir,
+      spaces: {
+        active: spaceInfo.activeId,
+        name: spaceInfo.activeName,
+        list: spaceInfo.spaces,
+        migrated: spaceInfo.migrated,
+        degraded: spaceInfo.degraded,
+        problems: spaceInfo.problems,
+        max: 10,
+      },
       now,
       query: q,
       hits,
@@ -2072,6 +2247,15 @@ export function apply(ctx, rawConfig) {
         return degraded;
       },
       dir: dataDir,
+      spaces: {
+        active: spaceInfo.activeId,
+        name: spaceInfo.activeName,
+        list: spaceInfo.spaces,
+        migrated: spaceInfo.migrated,
+        degraded: spaceInfo.degraded,
+        problems: spaceInfo.problems,
+        max: 10,
+      },
       /** 等到「载入 + 带外队列 + 挂起写盘」全部落定。 */
       async flush() {
         await loadPromise;
@@ -2614,5 +2798,5 @@ export function apply(ctx, rawConfig) {
     return Math.max(40, Math.min(soft, ceiling));
   }
 
-  log(`已加载，记忆库目录：${dataDir}`);
+  log(`已加载，当前分区「${spaceInfo.activeName}」：${dataDir}`);
 }
