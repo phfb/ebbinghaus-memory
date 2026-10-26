@@ -1,6 +1,6 @@
 {
   "name": "ebbinghaus-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "按艾宾浩斯遗忘曲线组织的三分区记忆：短期 / 长期 / 永久，到期升级、超容压缩、按需检索。",
   "type": "module",
   "license": "MIT",
@@ -50,7 +50,8 @@
     "dedup": "node tools/dedup.mjs",
     "export": "node tools/export.mjs",
     "import": "node tools/import.mjs",
-    "restore": "node tools/restore.mjs"
+    "restore": "node tools/restore.mjs",
+    "mirror": "node tools/mirror.mjs"
   },
   "keywords": [
     "dsh",

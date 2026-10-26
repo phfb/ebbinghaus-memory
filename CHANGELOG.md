@@ -12,6 +12,26 @@ node tools/check-patch-yaml.mjs
 
 ---
 
+## [0.2.0] - 2026-10-26
+
+### 新增
+
+- **自动备份镜像**：把记忆库全部文件 + `AGENT.md` / `prompt-inject.md` + （可选的）其它插件数据
+  同步到指定目录，附带一个双击就能用的恢复程序。
+  - 开关 `mirrorEnabled`（默认关）、频率 `mirrorEveryEntries`（默认 5 条，1-50）、
+    目录 `mirrorDir`（绝对路径，留空不备份）、额外路径 `mirrorExtraPaths`
+  - 镜像里有 `mirror-manifest.json` 清单 + `恢复记忆.cmd` + `_restore-memory.ps1`
+  - 恢复程序自己找目标库位置，会先问 y/N，会把当前库先备份一份；支持 `-Target` 指定目标
+  - 目录安全校验：不许和记忆库互相嵌套
+- `tools/mirror.mjs`：手动同步 / 预演清单
+- 镜像进度落在 `mirror-state.json`（和 `dedup-state.json` 同一个理由：不落盘就会每次重启归零）
+
+### 改动
+
+- 面板设置新增「自动备份镜像」一组，字符串字段（路径）现在有真正的文本框 / 文本域
+- 镜像时跳过 `node_modules` / `__pycache__` / `*.pyc` / `*.bak-*` / `.git` —— 那些是运行组件，不是数据
+
+
 ## [0.1.0] — 2026-10-25
 
 第一版。把 DSH 的对话记忆按**艾宾浩斯遗忘曲线**分成三层：

@@ -88,6 +88,7 @@ window.__ModuleLoader__.load({
       { title: '记忆库自检（重复合并）', keys: ['dedupEnabled', 'dedupEveryEntries', 'dedupThreshold'] },
       { title: '周期与写入频率', keys: ['shortDays', 'longDays', 'writeEveryTurns'] },
       { title: '每轮载入几条', keys: ['loadShortCount', 'loadLongRandom', 'loadPermanentCount'] },
+      { title: '自动备份镜像（记忆 + 人格 + 配置）', keys: ['mirrorEnabled', 'mirrorEveryEntries', 'mirrorDir', 'mirrorExtraPaths'] },
     ];
 
     /**
@@ -101,6 +102,8 @@ window.__ModuleLoader__.load({
       '真正的每轮 token 开销由「注入预算」决定（默认 1400），库里有 10 万字不等于每轮多花 10 万 —— 每次只有十几条进上下文。',
       '「记忆库自检」是第三道：每隔 N 条新记忆，把**说的是同一件事**的条目跨分区并成一条。它不注入对话、不调模型，纯本地跑，所以既不占上下文也不花钱；合并后细节留最全的那份，原文进 _archive。',
       '库越大，检索、面板渲染、每次回收判断都会慢一点。日常聊 60K～100K 够用很久；把库当日志天天猛写再往上调。',
+      '「自动备份镜像」把记忆库全部文件 + AGENT.md / prompt-inject.md 同步到另一个目录，每写入 N 条同步一次。镜像目录里会有一个 恢复记忆.cmd，双击就能把这份备份写回去（会先问你，也会先把当前库备份一份）。',
+      '镜像目录要填绝对路径，且不能和记忆库目录互相嵌套。想让它也带上其它插件的数据（比如 alive / qq-bot 的 data 目录），在「额外要镜像的路径」里一行写一个。',
     ];
 
     /** token 数缩写：10400 → 10.4K，100000 → 100K。 */
@@ -853,6 +856,46 @@ window.__ModuleLoader__.load({
           );
         }
 
+        // 字符串字段（镜像目录 / 额外路径）：渲染成文本框或文本域。
+        // 面板只负责原样回传，路径合不合法由 host 的 isSafeMirrorDir 判 ——
+        // 前端再写一遍路径校验，早晚会和后端判得不一样。
+        if (f.type === 'string') {
+          const text = edited ? String(draft[f.key] ?? '') : String(f.value ?? '');
+          const multiline = f.key === 'mirrorExtraPaths';
+          const boxStyle = {
+            ...settingInputStyle(),
+            width: '100%',
+            boxSizing: 'border-box',
+            fontFamily: 'Consolas, ui-monospace, monospace',
+          };
+          return h(
+            'label',
+            { key: f.key, style: { display: 'block', marginBottom: 8, fontSize: 12 } },
+            h(
+              'span',
+              { style: { display: 'block', color: C.text1, marginBottom: 3 } },
+              f.label || f.key,
+              f.overridden ? h('span', { style: { color: C.brand, fontSize: 11 } }, ' · 面板改过') : null,
+            ),
+            multiline
+              ? h('textarea', {
+                  value: text,
+                  rows: 3,
+                  'aria-label': f.label || f.key,
+                  placeholder: '每行一个绝对路径，比如 D:/plugin-data（可留空）',
+                  onChange: (ev) => props.onChange(f.key, ev && ev.target ? String(ev.target.value ?? '') : ''),
+                  style: { ...boxStyle, minHeight: 58, resize: 'vertical', lineHeight: 1.5 },
+                })
+              : h('input', {
+                  type: 'text',
+                  value: text,
+                  'aria-label': f.label || f.key,
+                  placeholder: '绝对路径，比如 D:/mirror/ebbinghaus（留空 = 不备份）',
+                  onChange: (ev) => props.onChange(f.key, ev && ev.target ? String(ev.target.value ?? '') : ''),
+                  style: boxStyle,
+                }),
+          );
+        }
         const value = edited ? draft[f.key] : String(f.value ?? '');
         return h(
           'label',

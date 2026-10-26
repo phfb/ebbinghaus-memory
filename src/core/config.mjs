@@ -120,6 +120,34 @@ export const CONFIG_SPEC = [
   { key: 'maxTokens', type: 'number', default: 1200, min: 200, max: 8000, step: 1, label: '固化最大输出 token' },
   { key: 'jobTimeoutMs', type: 'number', default: 60000, min: 5000, max: 600000, step: 1000, label: '后台任务超时（毫秒）' },
 
+  // ── 自动备份镜像（2026-10-26 加）─────────────────────────────────
+  // 「每 N 条同步一次」的口径跟 dedup 一样：自上次同步以来**新写进库**的条数。
+  // 备份内容：记忆库全部文件 + DSH 人格提示词（AGENT.md / prompt-inject.md）
+  // + 其它插件配置（靠 mirrorExtraPaths 手动列，见 README）。
+  // 刻意不带 node_modules / 插件源码 / exe —— 那些重装一份就好，塞进来只会让镜像变胖。
+  { key: 'mirrorEnabled', type: 'boolean', default: false, label: '自动备份镜像（记忆 + 人格提示词 + 插件配置）' },
+  {
+    key: 'mirrorEveryEntries',
+    type: 'number',
+    default: 5,
+    min: 1,
+    max: 50,
+    step: 1,
+    label: '每写入多少条记忆同步一次镜像（1-50）',
+  },
+  {
+    key: 'mirrorDir',
+    type: 'string',
+    default: '',
+    label: '镜像目录（绝对路径；留空 = 不备份）',
+  },
+  {
+    key: 'mirrorExtraPaths',
+    type: 'string',
+    default: '',
+    label: '额外要镜像的路径（每行一个，可留空）',
+  },
+
   { key: 'debugLog', type: 'boolean', default: false, label: '开发期调试日志（只打形状）' },
 ];
 
@@ -201,6 +229,10 @@ export const TUNABLE_KEYS = Object.freeze([
   'dedupEnabled',
   'dedupEveryEntries',
   'dedupThreshold',
+  'mirrorEnabled',
+  'mirrorEveryEntries',
+  'mirrorDir',
+  'mirrorExtraPaths',
 ]);
 
 /** @type {Record<string, ConfigField>} */

@@ -28,7 +28,7 @@
  * require，拿不到就没有设置表单，功能一样不少）。
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -43,6 +43,17 @@ import {
 } from '../core/config.mjs';
 import { pickReclaimGroup, tokenUsage, totalCapacityOf } from '../core/budget.mjs';
 import { dedupEveryOf, dedupThresholdOf, findDuplicateGroups, mergeDuplicateGroup } from '../core/dedup.mjs';
+import {
+  MANIFEST_FILE,
+  RESTORE_CMD,
+  RESTORE_PS1,
+  buildManifest,
+  isSafeMirrorDir,
+  planMirror,
+  renderRestoreCmd,
+  renderRestorePs1,
+  shouldSkipName,
+} from '../core/mirror.mjs';
 import { createStore } from '../core/store.mjs';
 import { ZONE_LABEL, ZONES, normalizeEntry } from '../core/schema.mjs';
 import { expiryOverview, fullStamp, relativeStamp, stampFor } from '../core/time.mjs';
@@ -120,6 +131,8 @@ const SETTINGS_FILE = 'settings.json';
  * 记的是：自上次自检以来新写了多少条、上次什么时候跑的、合并了几组、省了几条。
  */
 const DEDUP_STATE_FILE = 'dedup-state.json';
+/** 镜像同步进度（落在库目录）。和自检那个同一个理由：不落盘就会每次重启归零。 */
+const MIRROR_STATE_FILE = 'mirror-state.json';
 
 /** 总量回收一次最多压几轮。防配置异常时死循环。 */
 const TOTAL_RECLAIM_MAX_ROUNDS = 24;
@@ -1126,6 +1139,14 @@ export function apply(ctx, rawConfig) {
     }
 
     await store.save();
+
+    // 镜像：攒够 N 条就同步一次。失败只 warn —— 备份坏了不能连累记忆本身。
+    try {
+      await noteMirror(added);
+    } catch (err) {
+      warn(`镜像同步失败（不影响记忆）：${err instanceof Error ? err.message : String(err)}`);
+    }
+
     return added;
   }
 
@@ -1303,6 +1324,194 @@ export function apply(ctx, rawConfig) {
     return { before, after, capacity, rounds, withinCapacity, exhausted };
   }
 
+  /* ── 自动备份镜像（记忆 + 人格提示词 + 插件配置） ── */
+
+  /**
+   * 每写入多少条同步一次（1~50，默认 5）。
+   * @param {Record<string, any>} cfg
+   * @returns {number}
+   */
+  function mirrorEveryOf(cfg) {
+    const n = Math.round(Number(cfg?.mirrorEveryEntries));
+    if (!Number.isFinite(n)) return 5;
+    return Math.min(50, Math.max(1, n));
+  }
+
+  /**
+   * 镜像进度（落在库目录 mirror-state.json）。
+   * 和自检一样必须落盘：只放内存的话，每次重启 DSH 计数归零，
+   * 「每 5 条同步一次」就退化成「每 5 条、或者每次重开后的第一次写记忆」。
+   */
+  function readMirrorState(dir, warner) {
+    const base = {
+      entriesSinceMirror: 0,
+      lastAt: null,
+      lastOk: null,
+      lastError: null,
+      lastFiles: 0,
+      lastBytes: 0,
+      lastTrigger: null,
+    };
+    try {
+      const p = path.join(dir, MIRROR_STATE_FILE);
+      if (!existsSync(p)) return base;
+      const raw = JSON.parse(readFileSync(p, 'utf8'));
+      if (raw === null || typeof raw !== 'object') return base;
+      return { ...base, ...raw };
+    } catch (err) {
+      if (typeof warner === 'function') {
+        warner(`读 ${MIRROR_STATE_FILE} 失败，进度从零算：${err instanceof Error ? err.message : String(err)}`);
+      }
+      return base;
+    }
+  }
+
+  function writeMirrorState(dir, state) {
+    try {
+      const p = path.join(dir, MIRROR_STATE_FILE);
+      writeFileSync(p, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    } catch {
+      // 进度记不住不影响记忆本身
+    }
+  }
+
+  let mirrorState = readMirrorState(dataDir, earlyWarn);
+
+  /** 插件版本，写进 manifest —— 恢复时能看出这份备份是哪一版生成的。 */
+  function pluginVersionOf() {
+    try {
+      const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+      return typeof pkg?.version === 'string' ? pkg.version : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * 现在就把镜像跑一遍（全量覆盖）。
+   *
+   * 「镜像」两个字是字面意思：`library\` `dsh\` `extra\` 三个子树**整体重建**，
+   * 源里删掉的条目镜像里也会跟着消失。目录根下的用户自己的东西不碰。
+   *
+   * @param {'auto'|'manual'|'settings'|'init'} trigger
+   * @returns {Promise<{ok:boolean, files?:number, bytes?:number, dir?:string, reason?:string}>}
+   */
+  async function runMirrorNow(trigger) {
+    const dir = String(config.mirrorDir ?? '').trim();
+    const safe = isSafeMirrorDir(dir, dataDir);
+    if (!safe.ok) {
+      mirrorState = { ...mirrorState, lastOk: false, lastError: safe.reason };
+      writeMirrorState(dataDir, mirrorState);
+      return { ok: false, reason: safe.reason };
+    }
+
+    const mir = path.resolve(dir);
+    try {
+      mkdirSync(mir, { recursive: true });
+      for (const sub of ['library', 'dsh', 'extra']) {
+        try {
+          rmSync(path.join(mir, sub), { recursive: true, force: true });
+        } catch {
+          // 删不掉就覆盖，别因此整个同步失败
+        }
+      }
+
+      const plan = planMirror({ dataDir, dshHome: dshHome(), extraPaths: config.mirrorExtraPaths });
+      const files = [];
+      let bytes = 0;
+      for (const item of plan.items) {
+        if (!existsSync(item.src)) continue;
+        const dest = path.join(mir, item.rel.split('/').join(path.sep));
+        mkdirSync(path.dirname(dest), { recursive: true });
+        cpSync(item.src, dest, { recursive: true, force: true, filter: (s) => !shouldSkipName(path.basename(s)) });
+        let size = 0;
+        try {
+          size = statSync(dest).size;
+        } catch {
+          size = 0;
+        }
+        bytes += size;
+        files.push({ rel: item.rel, src: item.src, kind: item.kind, size, mtime: Date.now() });
+      }
+
+      const manifest = buildManifest({
+        createdAt: Date.now(),
+        dataDir,
+        dshHome: dshHome(),
+        counts: {
+          short: store.zones.short.length,
+          long: store.zones.long.length,
+          permanent: store.zones.permanent.length,
+        },
+        pluginVersion: pluginVersionOf(),
+        files,
+      });
+      writeFileSync(path.join(mir, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+
+      // 入口 .cmd 全英文，直接写；.ps1 里有大段中文，powershell 5.1 必须靠 BOM 才不会乱码
+      writeFileSync(path.join(mir, RESTORE_CMD), renderRestoreCmd(), 'utf8');
+      writeFileSync(path.join(mir, RESTORE_PS1), `\uFEFF${renderRestorePs1()}`, 'utf8');
+
+      mirrorState = {
+        ...mirrorState,
+        entriesSinceMirror: 0,
+        lastAt: new Date().toISOString(),
+        lastOk: true,
+        lastError: null,
+        lastFiles: files.length,
+        lastBytes: bytes,
+        lastTrigger: trigger,
+      };
+      writeMirrorState(dataDir, mirrorState);
+      for (const w of plan.warnings) warn(`镜像：${w}`);
+      return { ok: true, files: files.length, bytes, dir: mir };
+    } catch (err) {
+      mirrorState = { ...mirrorState, lastOk: false, lastError: err instanceof Error ? err.message : String(err) };
+      writeMirrorState(dataDir, mirrorState);
+      warn(`镜像同步失败：${mirrorState.lastError}`);
+      return { ok: false, reason: mirrorState.lastError };
+    }
+  }
+
+  /**
+   * 固化写完 N 条，够了就同步一次镜像。没够只记账。
+   * @param {number} added
+   */
+  async function noteMirror(added) {
+    const n = Math.round(Number(added) || 0);
+    if (n > 0) mirrorState.entriesSinceMirror = (Number(mirrorState.entriesSinceMirror) || 0) + n;
+    const ready =
+      config.mirrorEnabled === true && String(config.mirrorDir ?? '').trim() !== '';
+    if (!ready) {
+      if (n > 0) writeMirrorState(dataDir, mirrorState);
+      return null;
+    }
+    if (mirrorState.entriesSinceMirror < mirrorEveryOf(config)) {
+      writeMirrorState(dataDir, mirrorState);
+      return null;
+    }
+    return runMirrorNow('auto');
+  }
+
+  /** 面板要的镜像状态。**只在这里拼一份** —— 两处各拼一次早晚会不一致。 */
+  function mirrorPanelState() {
+    const dir = String(config.mirrorDir ?? '').trim();
+    const safe = isSafeMirrorDir(dir, dataDir);
+    return {
+      enabled: Boolean(config.mirrorEnabled),
+      every: mirrorEveryOf(config),
+      dir,
+      dirOk: safe.ok,
+      dirReason: safe.reason,
+      pending: Number(mirrorState.entriesSinceMirror) || 0,
+      lastAt: mirrorState.lastAt,
+      lastOk: mirrorState.lastOk,
+      lastError: mirrorState.lastError,
+      lastFiles: Number(mirrorState.lastFiles) || 0,
+      lastBytes: Number(mirrorState.lastBytes) || 0,
+      lastTrigger: mirrorState.lastTrigger,
+    };
+  }
   /* ── 记忆库自检：重复记忆合并 ── */
 
   /**
@@ -1771,6 +1980,7 @@ export function apply(ctx, rawConfig) {
       rejected,
       changed,
       settings: settingsSnapshot(),
+      mirror: mirrorPanelState(),
       tokens,
       // 改了上限之后已经超了 → 告诉调用方「我这就去后台收」
       reclaim: tokens.over,
@@ -1840,6 +2050,7 @@ export function apply(ctx, rawConfig) {
       tokens: tokenUsage(store.zones, config, now),
       // 面板设置：字段定义 + 当前值 + 底座值，一次给全，客户端不重复写字段表
       settings: settingsSnapshot(),
+      mirror: mirrorPanelState(),
       // 记忆库自检的进度（面板上「上次自检」那一行）
       dedup: dedupPanelState(),
       config: {
@@ -2085,6 +2296,7 @@ export function apply(ctx, rawConfig) {
                 return reply(res, 200, {
                   ok: true,
                   settings: settingsSnapshot(),
+                  mirror: mirrorPanelState(),
                   tokens: tokenUsage(store.zones, config, Date.now()),
                 });
               }
