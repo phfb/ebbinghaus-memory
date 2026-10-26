@@ -1336,6 +1336,25 @@ window.__ModuleLoader__.load({
             setSettingsNotice(`镜像没成功：${String((err && err.message) || err)}`);
           });
       }
+      /**
+       * 切当前记忆分区。
+       * **只影响之后新开的对话** —— 已经聊着的会话按绑定走，记忆不会换人。
+       * @param {string} id
+       */
+      function switchSpace(id) {
+        const target = typeof id === 'string' ? id.trim() : '';
+        if (target === '') return;
+        setBusy('分区');
+        postJson('/spaces/active', { id: target })
+          .then(() => {
+            setBusy('');
+            reload();
+          })
+          .catch((err) => {
+            setBusy('');
+            setSettingsNotice(`切分区没成功：${String((err && err.message) || err)}`);
+          });
+      }
       function submit() {
         const q = draft.trim();
         setQuery(q);
@@ -1668,6 +1687,45 @@ window.__ModuleLoader__.load({
             zones.map((z) => h(Meter, { key: z.key, zone: z })),
             totalZone !== null ? h(Meter, { key: 'total', zone: totalZone, fmt: fmtTokens }) : null,
           ),
+
+          (() => {
+            const sp = isObj(d.spaces) ? d.spaces : null;
+            const list = sp && Array.isArray(sp.list) ? sp.list : [];
+            if (list.length === 0) return null;
+            const fmt = (s) =>
+              `${s.name}（短 ${num(s.counts && s.counts.short, 0)} · 长 ${num(s.counts && s.counts.long, 0)} · 永 ${num(
+                s.counts && s.counts.permanent,
+                0,
+              )}）`;
+            return h(
+              'div',
+              {
+                style: {
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  marginBottom: 14,
+                  flexWrap: 'wrap',
+                },
+              },
+              h('span', { style: { fontSize: 12, color: C.text2 } }, '当前记忆分区'),
+              h(
+                'select',
+                {
+                  value: sp.active || '',
+                  'aria-label': '当前记忆分区',
+                  onChange: (ev) => switchSpace(ev && ev.target ? ev.target.value : ''),
+                  style: { ...settingInputStyle(), minWidth: 190 },
+                },
+                list.map((s) => h('option', { key: s.id, value: s.id }, fmt(s))),
+              ),
+              h(
+                'span',
+                { style: { fontSize: 11, color: C.text2 } },
+                '切换只影响新开的对话；已经聊着的会话留在原分区',
+              ),
+            );
+          })(),
 
           h(Section, { title: '记忆库自检' }, dedupBody),
 

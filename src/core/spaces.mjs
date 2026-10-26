@@ -234,3 +234,90 @@ export function verifyMigration(counts, expect) {
   }
   return { ok: problems.length === 0, problems };
 }
+
+
+/* ───────────────── 会话 → 分区 绑定 ───────────────── */
+
+export const BINDINGS_FILE = 'space-bindings.json';
+
+/**
+ * 绑定表整流。**永不抛**：坏的丢掉、非法的丢掉，剩下的照常用。
+ *
+ * 结构：`{ version: 1, bindings: { [sessionId]: spaceId } }`
+ *
+ * @param {unknown} raw
+ * @returns {{bindings: Record<string,string>, problems: string[]}}
+ */
+export function parseBindings(raw) {
+  const problems = [];
+  const out = {};
+  if (raw === null || typeof raw !== 'object') return { bindings: out, problems };
+  const src = raw.bindings && typeof raw.bindings === 'object' ? raw.bindings : {};
+  for (const [k, v] of Object.entries(src)) {
+    const sid = String(k ?? '').trim();
+    const id = String(v ?? '').trim();
+    if (sid === '') continue;
+    if (!isValidSpaceId(id)) {
+      problems.push(`会话 ${sid} 的绑定指向非法分区（${id}），已忽略`);
+      continue;
+    }
+    out[sid] = id;
+  }
+  return { bindings: out, problems };
+}
+
+/**
+ * 这个会话该用哪个分区：**绑定优先，否则跟着当前激活分区**。
+ * 绑定指向的分区如果已经不存在了（被删），也回落到 active。
+ *
+ * @param {Record<string,string>} bindings
+ * @param {string} activeId
+ * @param {string} sessionId
+ * @param {string[]} [knownIds] 现存的合法分区 id（给了就顺便校验绑定是否还有效）
+ * @returns {string}
+ */
+export function resolveSessionSpace(bindings, activeId, sessionId, knownIds) {
+  const sid = String(sessionId ?? '').trim();
+  const active = isValidSpaceId(activeId) ? activeId : DEFAULT_SPACE_ID;
+  if (sid === '') return active;
+  const bound = bindings && typeof bindings === 'object' ? bindings[sid] : undefined;
+  if (!isValidSpaceId(bound)) return active;
+  if (Array.isArray(knownIds) && knownIds.length > 0 && !knownIds.includes(bound)) return active;
+  return bound;
+}
+
+/**
+ * 会话第一次出现时，把它钉在当前的激活分区上。
+ * **已经钉过就不动** —— 这就是「旧会话留在原分区」的实现。
+ *
+ * @param {Record<string,string>} bindings 会被原地改
+ * @param {string} sessionId
+ * @param {string} activeId
+ * @returns {boolean} 这次有没有新增绑定
+ */
+export function bindIfNew(bindings, sessionId, activeId) {
+  const sid = String(sessionId ?? '').trim();
+  if (sid === '') return false;
+  if (bindings === null || typeof bindings !== 'object') return false;
+  if (Object.prototype.hasOwnProperty.call(bindings, sid)) return false;
+  const active = isValidSpaceId(activeId) ? activeId : DEFAULT_SPACE_ID;
+  bindings[sid] = active;
+  return true;
+}
+
+/**
+ * 绑定表瘦身：只留还存在着的分区。删分区时顺手清掉，免得表越攒越长。
+ * @param {Record<string,string>} bindings
+ * @param {string[]} knownIds
+ * @returns {{bindings: Record<string,string>, removed: number}}
+ */
+export function pruneBindings(bindings, knownIds) {
+  const ids = Array.isArray(knownIds) ? knownIds : [];
+  const out = {};
+  let removed = 0;
+  for (const [sid, id] of Object.entries(bindings ?? {})) {
+    if (ids.includes(id)) out[sid] = id;
+    else removed += 1;
+  }
+  return { bindings: out, removed };
+}

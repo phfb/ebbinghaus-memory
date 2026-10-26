@@ -509,6 +509,9 @@ test('HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
     '/ebbinghaus/reclaim',
     '/ebbinghaus/reload',
     '/ebbinghaus/settings',
+    '/ebbinghaus/spaces/active',
+    '/ebbinghaus/spaces/bind',
+    '/ebbinghaus/spaces/unbind',
     '/ebbinghaus/state',
   ]);
 
@@ -1331,4 +1334,120 @@ test('记忆库自检：关掉之后不会自动跑，但手动还能跑', async
   const manual = await svc.dedup({});
   assert.equal(manual.skipped, '');
   assert.equal(manual.groups, 1);
+});
+
+/* ─────────────────── 多主分区：会话绑定 ─────────────────── */
+
+/** 造一个「两个分区 + 绑定表」的库根。 */
+function makeTwoSpaces(dir, bindings = {}) {
+  for (const id of ['private', 'work']) {
+    const p = path.join(dir, 'spaces', id);
+    mkdirSync(p, { recursive: true });
+  }
+  writeFileSync(
+    path.join(dir, 'spaces.json'),
+    JSON.stringify({
+      version: 1,
+      active: 'private',
+      spaces: [
+        { id: 'private', name: '私生活', createdAt: new Date().toISOString() },
+        { id: 'work', name: '工作', createdAt: new Date().toISOString() },
+      ],
+    }),
+    'utf8',
+  );
+  if (Object.keys(bindings).length > 0) {
+    writeFileSync(path.join(dir, 'space-bindings.json'), JSON.stringify({ version: 1, bindings }), 'utf8');
+  }
+}
+
+test('多分区：两个会话各写各自的分区，互不串', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir, { 'sess-work': 'work' });
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '他在做记忆插件')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  // 会话 A：没有绑定 → 跟随 active（private）
+  const a = makeAgent('sess-home', h.sections);
+  h.emit('agent/created', { agent: a });
+  h.emit('session/event', { id: 'sess-home' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '今天干点啥' }] },
+  });
+  h.emit('agent/turn-stopping', { agent: a });
+  await h.services.get('ebbinghausMemory').flush();
+
+  // 会话 B：绑在 work 上
+  const b = makeAgent('sess-work', h.sections);
+  h.emit('agent/created', { agent: b });
+  h.emit('session/event', { id: 'sess-work' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '那个接口改完了' }] },
+  });
+  h.emit('agent/turn-stopping', { agent: b });
+  await h.services.get('ebbinghausMemory').flush();
+
+  const readZone = (spaceId, zone) => {
+    const p = path.join(dir, 'spaces', spaceId, `${zone}.jsonl`);
+    if (!existsSync(p)) return [];
+    return readFileSync(p, 'utf8').split('\n').filter((s) => s.trim() !== '').map((s) => JSON.parse(s));
+  };
+
+  const homeAll = [...readZone('private', 'short'), ...readZone('private', 'long'), ...readZone('private', 'permanent')];
+  const workAll = [...readZone('work', 'short'), ...readZone('work', 'long'), ...readZone('work', 'permanent')];
+
+  assert.ok(homeAll.length >= 1, 'private 应当写进了记忆');
+  assert.ok(workAll.length >= 1, 'work 应当写进了记忆');
+  // 两边内容不能一样（各写各的）
+  const homeIds = new Set(homeAll.map((e) => e.id));
+  assert.equal(workAll.every((e) => !homeIds.has(e.id)), true, '两个分区的条目不许串');
+
+  // 绑定表也落盘了（work 这条是预先写的，不该被改）
+  const bindings = JSON.parse(readFileSync(path.join(dir, 'space-bindings.json'), 'utf8')).bindings;
+  assert.equal(bindings['sess-work'], 'work');
+  assert.equal(bindings['sess-home'], 'private', '新会话要被钉在当时的 active 上');
+});
+
+test('多分区：切 active 之后，老会话仍留在原分区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir);
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '他在做记忆插件')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const oldSession = makeAgent('sess-old', h.sections);
+  h.emit('agent/created', { agent: oldSession });
+  h.emit('session/event', { id: 'sess-old' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第一句' }] },
+  });
+
+  // 切到 work（走真实路由）
+  const route = h.route('/ebbinghaus/spaces/active');
+  assert.ok(route, '要有 /spaces/active 路由');
+  const res = fakeRes();
+  await route.handler(fakeReq({ method: 'POST', url: '/ebbinghaus/spaces/active', body: { id: 'work' } }), res);
+  assert.equal(res.json().ok, true, '切换要成功，响应：' + String(res._out.body));
+  assert.equal(res.json().active, 'work');
+
+  // 老会话再说话 —— 它已经被钉在 private，不该跟着跑
+  h.emit('session/event', { id: 'sess-old' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第二句' }] },
+  });
+  h.emit('agent/turn-stopping', { agent: oldSession });
+  await h.services.get('ebbinghausMemory').flush();
+
+  const bindings = JSON.parse(readFileSync(path.join(dir, 'space-bindings.json'), 'utf8')).bindings;
+  assert.equal(bindings['sess-old'], 'private', '老会话必须留在原分区');
+
+  const reg = JSON.parse(readFileSync(path.join(dir, 'spaces.json'), 'utf8'));
+  assert.equal(reg.active, 'work', '注册表里的 active 也要跟着改');
 });

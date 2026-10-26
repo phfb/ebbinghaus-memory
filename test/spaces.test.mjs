@@ -15,7 +15,11 @@ import {
   makeSpaceId,
   normalizeSpaceName,
   parseRegistry,
+  bindIfNew,
+  parseBindings,
   planLegacyMigration,
+  pruneBindings,
+  resolveSessionSpace,
   spaceDirOf,
   verifyMigration,
 } from '../src/core/spaces.mjs';
@@ -204,4 +208,52 @@ test('ensureSpaces：注册表坏掉也照样能用（回退默认分区 + 记�
   assert.equal(r.activeId, DEFAULT_SPACE_ID);
   assert.ok(r.problems.some((p) => p.includes('spaces.json')), '要说一句为什么');
   assert.equal(existsSync(r.spaceDir), true);
+});
+
+/* ─────────────────── 会话 → 分区 绑定 ─────────────────── */
+
+test('parseBindings: 坏数据整流，非法分区 id 丢掉', () => {
+  const { bindings, problems } = parseBindings({
+    bindings: { 'sess-a': 'work', 'sess-b': '非法', '': 'work' },
+  });
+  assert.equal(bindings['sess-a'], 'work');
+  assert.equal('sess-b' in bindings, false);
+  assert.equal(Object.keys(bindings).length, 1);
+  assert.ok(problems.length >= 1);
+});
+
+test('parseBindings: 空表 / 非对象都不炸', () => {
+  assert.deepEqual(parseBindings(null).bindings, {});
+  assert.deepEqual(parseBindings({}).bindings, {});
+  assert.deepEqual(parseBindings({ bindings: 'x' }).bindings, {});
+});
+
+test('resolveSessionSpace: 有绑定走绑定，没绑定跟 active', () => {
+  const b = { 'sess-a': 'work' };
+  assert.equal(resolveSessionSpace(b, 'private', 'sess-a'), 'work');
+  assert.equal(resolveSessionSpace(b, 'private', 'sess-new'), 'private');
+  assert.equal(resolveSessionSpace(b, 'private', ''), 'private');
+});
+
+test('resolveSessionSpace: 绑定的分区已经不存在了 → 回落到 active', () => {
+  const b = { 'sess-a': 'gone' };
+  assert.equal(resolveSessionSpace(b, 'private', 'sess-a', ['private', 'work']), 'private');
+  assert.equal(resolveSessionSpace(b, 'private', 'sess-a', ['gone', 'private']), 'gone');
+});
+
+test('bindIfNew: 第一次钉住，第二次不覆盖', () => {
+  const b = {};
+  assert.equal(bindIfNew(b, 'sess-a', 'private'), true);
+  assert.equal(b['sess-a'], 'private');
+  assert.equal(bindIfNew(b, 'sess-a', 'work'), false, '钉过就不许改');
+  assert.equal(b['sess-a'], 'private');
+  assert.equal(bindIfNew(b, '', 'work'), false);
+});
+
+test('pruneBindings: 分区没了就把绑定清掉', () => {
+  const b = { 'sess-a': 'work', 'sess-b': 'gone' };
+  const r = pruneBindings(b, ['private', 'work']);
+  assert.equal(r.bindings['sess-a'], 'work');
+  assert.equal('sess-b' in r.bindings, false);
+  assert.equal(r.removed, 1);
 });

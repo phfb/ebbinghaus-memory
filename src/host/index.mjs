@@ -65,6 +65,11 @@ import {
   findSpace,
   parseRegistry,
   planLegacyMigration,
+  BINDINGS_FILE,
+  bindIfNew,
+  isValidSpaceId,
+  parseBindings,
+  resolveSessionSpace,
   spaceDirOf,
   verifyMigration,
 } from '../core/spaces.mjs';
@@ -517,7 +522,8 @@ export function apply(ctx, rawConfig) {
   /** 分区账本：当前激活哪个、都有哪些、有没有刚搬过家。 */
   const spaceInfo = ensureSpaces(libraryRoot);
   /** 当前激活分区的目录 —— 下面几百行里所有的「库目录」指的都是它。 */
-  const dataDir = spaceInfo.spaceDir;
+  /** 当前激活分区的目录。**`let`**：热切换分区时会跟着换。 */
+  let dataDir = spaceInfo.spaceDir;
   /**
    * 读覆盖层要赶在 `emit()` 定义之前（`emit` 自己要用 config）。
    * 所以这里用一个只走 ctx.logger 的极简出口 —— 读失败本身就是异常路径，
@@ -587,7 +593,144 @@ export function apply(ctx, rawConfig) {
 
   /* ── 记忆库 ── */
 
-  const store = createStore({ dir: dataDir, log, warn });
+  /** 当前激活的分区 id（运行时真值；spaces.json 里的 active 只是持久化副本）。 */
+  let activeSpaceId = spaceInfo.activeId;
+  /** 当前正在操作的分区：串行任务 / 渲染期间临时设置；null = 跟随激活分区。 */
+  let opSpaceId = null;
+
+  /** 每个分区的真 store（激活分区那份也在这里，保证始终是同一个对象）。 */
+  /** @type {Map<string, any>} */
+  const storePool = new Map();
+
+  function realStoreOf(spaceId) {
+    const sid = String(spaceId || activeSpaceId);
+    let real = storePool.get(sid);
+    if (real === undefined) {
+      const dir = sid === activeSpaceId ? dataDir : spaceDirOf(libraryRoot, sid);
+      real = createStore({ dir, log, warn });
+      storePool.set(sid, real);
+    }
+    return real;
+  }
+
+  /**
+   * 全局 `store` 是个**代理**：每次访问都转发到「当前操作分区」的真 store。
+   *
+   * 为什么这么做：固化 → 压缩 → 总量回收 → 自检 → 落盘 这条链有几十处 `store.xxx`，
+   * 分散在七八个函数里。逐个传 spaceId 参数意味着每个函数、每层调用都要改，
+   * 漏一处就是「A 的记忆写进 B 的库」这种静默事故。
+   * 换成代理之后，只要**入口**把 opSpaceId 设对，整条链自动落在正确的分区里。
+   */
+  const store = new Proxy({}, {
+    get(_target, prop) {
+      const real = realStoreOf(opSpaceId ?? activeSpaceId);
+      const value = Reflect.get(real, prop);
+      return typeof value === 'function' ? value.bind(real) : value;
+    },
+  });
+
+  /** 会话 → 分区 的绑定表。钉住就不动 —— 旧会话不会被后来的切换抢走。 */
+  /** @type {Record<string, string>} */
+  let bindings = {};
+  const bindingsPath = path.join(libraryRoot, BINDINGS_FILE);
+  try {
+    if (existsSync(bindingsPath)) {
+      const parsed = parseBindings(JSON.parse(readFileSync(bindingsPath, 'utf8')));
+      bindings = parsed.bindings;
+      for (const msg of parsed.problems) warn(`绑定表：${msg}`);
+    }
+  } catch (err) {
+    warn(`绑定表读不了，所有会话都跟随当前分区：${err instanceof Error ? err.message : String(err)}`);
+    bindings = {};
+  }
+
+  /** 取某个分区的运行时（只包 id / dir / store，真东西都在 storePool）。 */
+  function ensureRuntime(id) {
+    const sid = String(id || activeSpaceId);
+    const dir = sid === activeSpaceId ? dataDir : spaceDirOf(libraryRoot, sid);
+    return { id: sid, dir, store: realStoreOf(sid) };
+  }
+
+  /** 这个会话落在哪个分区：绑定优先，绑定失效就跟随当前分区。 */
+  function spaceIdOfSession(sessionId) {
+    const known = (spaceInfo.spaces ?? []).map((sp) => sp.id);
+    return resolveSessionSpace(bindings, activeSpaceId, sessionId, known);
+  }
+
+  /** 取这个会话该用的真 store —— 注入和固化都从它拿。 */
+  function storeOfSession(sessionId) {
+    return realStoreOf(spaceIdOfSession(sessionId));
+  }
+
+  /** 会话第一次出现就钉住分区；已经钉过的不动。 */
+  function bindSessionIfNew(sessionId) {
+    if (!bindIfNew(bindings, sessionId, activeSpaceId)) return;
+    persistBindings();
+  }
+
+  /** 把绑定表落盘（失败只 warn —— 记不住绑定不影响记忆）。 */
+  function persistBindings() {
+    try {
+      writeFileSync(bindingsPath, `${JSON.stringify({ version: 1, bindings }, null, 2)}\n`, 'utf8');
+    } catch (err) {
+      warn(`绑定表落盘失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** 面板要的分区列表：每个分区的条数、是不是当前这个。 */
+  function spacesPanelList() {
+    return (spaceInfo.spaces ?? []).map((sp) => {
+      const rt = ensureRuntime(sp.id);
+      return {
+        id: sp.id,
+        name: sp.name,
+        createdAt: sp.createdAt,
+        active: sp.id === activeSpaceId,
+        counts: {
+          short: rt.store.zones.short.length,
+          long: rt.store.zones.long.length,
+          permanent: rt.store.zones.permanent.length,
+        },
+      };
+    });
+  }
+
+  /** 在某个分区的上下文里跑一段（同步或异步都行），跑完恢复。 */
+  async function withSpace(spaceId, fn) {
+    const prev = opSpaceId;
+    opSpaceId = spaceId;
+    try {
+      return await fn();
+    } finally {
+      opSpaceId = prev;
+    }
+  }
+
+  /**
+   * 切当前分区（热切换，不用重启 DSH）。
+   *
+   * **只影响后续新会话** —— 已经钉住的会话按 binding 走，旧对话的记忆不会换人。
+   * @param {string} id
+   */
+  function setActiveSpace(id) {
+    if (!isValidSpaceId(id)) return { ok: false, reason: `分区 id 不合法：${id}` };
+    const known = (spaceInfo.spaces ?? []).map((sp) => sp.id);
+    if (!known.includes(id)) return { ok: false, reason: `没有这个分区：${id}` };
+    if (id !== activeSpaceId) {
+      activeSpaceId = id;
+      dataDir = spaceDirOf(libraryRoot, id);
+      try {
+        const regPath = path.join(libraryRoot, REGISTRY_FILE);
+        const reg = JSON.parse(readFileSync(regPath, 'utf8'));
+        reg.active = id;
+        writeFileSync(regPath, `${JSON.stringify(reg, null, 2)}\n`, 'utf8');
+      } catch {
+        // 落不了盘也不影响这次运行
+      }
+      invalidateAllRenders();
+    }
+    return { ok: true, id };
+  }
 
   let ready = false;
   /** 磁盘坏了就只读不写 —— 绝不因为记忆坏了挡住聊天。 */
@@ -631,6 +774,18 @@ export function apply(ctx, rawConfig) {
   const loadPromise = (async () => {
     try {
       const r = await store.load();
+
+      // 其它分区也一并载入：注入是同步渲染的，等用到了再 await 来不及。
+      // 最多 10 个分区、每个几十 KB，这点启动时间换「随时可切」值得。
+      for (const sp of spaceInfo.spaces ?? []) {
+        if (sp.id === activeSpaceId) continue;
+        try {
+          const other = await ensureRuntime(sp.id).store.load();
+          if (other?.ok === false) warn(`分区「${sp.name ?? sp.id}」载入失败，只读不记`);
+        } catch (err) {
+          warn(`分区「${sp.name ?? sp.id}」载入异常：${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       if (r?.ok === false) {
         degraded = true;
         warn('记忆库载入失败，本次以「只读不记」模式运行');
@@ -654,6 +809,18 @@ export function apply(ctx, rawConfig) {
    * 会换着花样想起不同的事 —— 很出戏，而且检索冷却会白白烧掉。
    */
   function renderFor(agentId) {
+    // 渲染要按「这个会话绑定的分区」取记忆。renderForInner 里那几十处 store.xxx
+    // 全靠 opSpaceId 指路，所以这里设好再交给内层。
+    const prev = opSpaceId;
+    opSpaceId = spaceIdOfSession(agentId);
+    try {
+      return renderForInner(agentId);
+    } finally {
+      opSpaceId = prev;
+    }
+  }
+
+  function renderForInner(agentId) {
     if (!ready || degraded || !config.enabled) return '';
     const s = stateOf(agentId);
     if (s.renderCache.turn === s.turn) return s.renderCache.text;
@@ -810,6 +977,8 @@ export function apply(ctx, rawConfig) {
 
       const id = session?.id;
       if (typeof id !== 'string' || id === '') return;
+      // 会话第一次出现就把它钉在当前分区上：之后再切，这个会话也不会被抢走。
+      bindSessionIfNew(id);
       const s = stateOf(id);
 
       if (event?.type === 'user/message') {
@@ -1120,6 +1289,11 @@ export function apply(ctx, rawConfig) {
    * @param {AbortSignal} signal 这个任务自己的可中止信号
    */
   async function consolidate(sessionId, agent, signal) {
+    // 这条链会一路调到压缩 / 总量回收 / 自检 / 落盘，全都靠 opSpaceId 找对分区。
+    return withSpace(spaceIdOfSession(sessionId), () => consolidateInner(sessionId, agent, signal));
+  }
+
+  async function consolidateInner(sessionId, agent, signal) {
     // 载入是异步的：插件刚起来时 store 还是空的。等它，别拿空库去固化。
     await loadPromise;
     if (!ready || degraded) {
@@ -2208,9 +2382,10 @@ export function apply(ctx, rawConfig) {
       degraded,
       dir: dataDir,
       spaces: {
-        active: spaceInfo.activeId,
-        name: spaceInfo.activeName,
-        list: spaceInfo.spaces,
+        active: activeSpaceId,
+        name: (findSpace({ spaces: spaceInfo.spaces }, activeSpaceId) ?? {}).name ?? activeSpaceId,
+        list: spacesPanelList(),
+        bindings: Object.keys(bindings).length,
         migrated: spaceInfo.migrated,
         degraded: spaceInfo.degraded,
         problems: spaceInfo.problems,
@@ -2519,6 +2694,77 @@ export function apply(ctx, rawConfig) {
                 tokens: tokenUsage(store.zones, config, Date.now()),
                 total: store.all().length,
               });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          kind: 'exact',
+          path: `${PANEL_BASE}/spaces/active`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              let body;
+              try {
+                body = await readBody(req);
+              } catch (err) {
+                return fail(res, 413, err);
+              }
+              const id = typeof body?.id === 'string' ? body.id.trim() : '';
+              const r = setActiveSpace(id);
+              if (!r.ok) return reply(res, 400, { ok: false, error: r.reason });
+              return reply(res, 200, { ok: true, active: activeSpaceId, spaces: spacesPanelList() });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          kind: 'exact',
+          path: `${PANEL_BASE}/spaces/bind`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              let body;
+              try {
+                body = await readBody(req);
+              } catch (err) {
+                return fail(res, 413, err);
+              }
+              const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+              const id = typeof body?.id === 'string' ? body.id.trim() : '';
+              if (sessionId === '') return reply(res, 400, { ok: false, error: '缺 sessionId' });
+              if (!isValidSpaceId(id)) return reply(res, 400, { ok: false, error: `分区 id 不合法：${id}` });
+              const known = (spaceInfo.spaces ?? []).map((sp) => sp.id);
+              if (!known.includes(id)) return reply(res, 400, { ok: false, error: `没有这个分区：${id}` });
+              bindings[sessionId] = id;
+              persistBindings();
+              invalidateRender(sessionId);
+              return reply(res, 200, { ok: true, sessionId, space: id });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          kind: 'exact',
+          path: `${PANEL_BASE}/spaces/unbind`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              let body;
+              try {
+                body = await readBody(req);
+              } catch (err) {
+                return fail(res, 413, err);
+              }
+              const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+              if (sessionId === '') return reply(res, 400, { ok: false, error: '缺 sessionId' });
+              delete bindings[sessionId];
+              persistBindings();
+              invalidateRender(sessionId);
+              return reply(res, 200, { ok: true, sessionId });
             } catch (err) {
               return fail(res, 500, err);
             }
