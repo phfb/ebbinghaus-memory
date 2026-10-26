@@ -32,7 +32,7 @@ node tools/preview-injection.mjs      # 看看当前库渲染进上下文长什�
 > & $node --test
 > ```
 >
-> 找不到就搜一下 `Get-ChildItem "D:\DSH" -Filter node.exe -Recurse | Select -First 5`。
+> 找不到就搜一下 `Get-ChildItem $env:LOCALAPPDATA -Filter node.exe -Recurse -ErrorAction SilentlyContinue | Select -First 5`。
 
 装了插件之后想验证「真能用」（测试全绿 ≠ 插件能加载），装到**临时 profile** 里跑一遍，
 别动你自己的 `desktop`：
@@ -92,10 +92,9 @@ $dsh = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\ds
 ```
 *.jsonl              meta.json        settings.json      dedup-state.json
 _archive/            _exports/        _backup-*/         [object Object]/
-persona.md           relationship.json   USER-PROFILE.md
 ```
 
-跑完迁移 / 导入 / 压力测试之后，`git status` 里不许出现它们。CI 里有一道检查专门守这条
+跑完导入 / 压力测试之后，`git status` 里不许出现它们。CI 里有一道检查专门守这条
 （`lint-shape` job），混进来会直接红。
 
 贴日志之前也顺手扫一遍 —— 虽然 `debugLog` 只打形状（条数 / token / 耗时）、

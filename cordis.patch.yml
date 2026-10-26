@@ -16,7 +16,7 @@
         # 总开关
         enabled: true
         # 记忆库目录。留空 = $DSH_HOME/ebbinghaus-memory
-        # （本机就是 D:/DSH/dsh-home/ebbinghaus-memory）
+        # （例如 %DSH_HOME%/ebbinghaus-memory）
         dataDir: ''
         # ── 两个临时分区的周期 ────────────────────────────────────
         # ⚠️ 单位写的是「天」，但**算的是时间戳差**：now - 事件时间 >= N × 24 小时。

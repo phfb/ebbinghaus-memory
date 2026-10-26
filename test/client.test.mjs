@@ -234,7 +234,7 @@ function payload(over = {}) {
     ok: true,
     ready: true,
     degraded: false,
-    dir: 'D:/DSH/dsh-home/ebbinghaus-memory',
+    dir: 'C:/Users/you/dsh-home/ebbinghaus-memory',
     now: NOW,
     query: '',
     hits: [],
@@ -655,7 +655,7 @@ const tokenPayload = () =>
       byZone: { short: 3000, long: 2400, permanent: 5000 },
     },
     settings: {
-      file: 'D:/DSH/dsh-home/ebbinghaus-memory/settings.json',
+      file: 'C:/Users/you/dsh-home/ebbinghaus-memory/settings.json',
       overridden: false,
       fields: [
         {

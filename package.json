@@ -46,7 +46,6 @@
     "test": "node --test",
     "check": "node tools/check-patch-yaml.mjs",
     "smoke": "node tools/smoke-cordis.mjs",
-    "migrate": "node tools/migrate.mjs",
     "preview": "node tools/preview-injection.mjs",
     "dedup": "node tools/dedup.mjs",
     "export": "node tools/export.mjs",

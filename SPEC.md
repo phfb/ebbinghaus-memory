@@ -37,7 +37,7 @@
 | `src/core/zones.mjs` `compress.mjs` `recall.mjs` `render.mjs` | **core-agent** | 三分区策略、压缩、检索、注入渲染 |
 | `src/host/index.mjs` | **host-agent** | 事件钩子、固化、工具、HTTP |
 | `src/client/index.js` | **client-agent** | 侧栏面板 |
-| `tools/migrate.mjs` `tools/check-patch-yaml.mjs` | **migrate-agent** | 旧记忆导入、yaml 校验 |
+| `tools/check-patch-yaml.mjs` | — | 补丁 yaml 校验 |
 
 **零运行时依赖**：谁也不许 `import` 任何 `@deepseek-ai/dsh-*`；core 层是纯 ESM 纯函数。
 `node --test` 能直接跑，不许有构建步骤。
@@ -77,7 +77,7 @@
    不会被算成 1 行坏数据。
 2. **建不出来只 `warn`，绝不抛。** 只读目录、权限不足时插件必须照样加载 ——
    记忆写不进去是次要故障，插件起不来是主要故障。
-3. **`reload()` 复用同一套逻辑**，所以外部工具（migrate / import）跑完再 reload
+3. **`reload()` 复用同一套逻辑**，所以外部工具（import / restore）跑完再 reload
    也不会把已有文件重写一遍。
 
 ---
@@ -215,7 +215,7 @@ await store.mergeFromDisk()            // save() 内部自动调：合并外部�
 
 **两条不能省的写盘纪律：**
 
-1. **落盘前先合并磁盘。** 只要有两个写者（插件 + `tools/migrate.mjs`、或两个插件实例），
+1. **落盘前先合并磁盘。** 只要有两个写者（插件 + `tools/import.mjs`、或两个插件实例），
    后落盘的就会静默抹掉先落盘的。`save()` 会先读一遍磁盘，把「磁盘上有、内存里没有」
    且不在墓碑里的条目合并进来，再整份重写。
 2. **删除必须立墓碑**（`meta.deleted_ids`）。不立的话，上面那次合并会读回刚删掉的那条
@@ -356,7 +356,7 @@ export function renderEntryLine(entry, { now, detailLimit }) -> string
 规则：
 - 空区整段不出现（不写「（空）」）。
 - 每条占一行，`[时间] title —— detail截断 · weight`。
-  如果 `detail` 以 `title` 开头（迁移进来的旧日记就是这种形状），**只渲染一份** ——
+  如果 `detail` 以 `title` 开头（从别处导入的旧记忆就是这种形状），**只渲染一份** ——
   否则会读成「…不是我新 —— …不是我新装的 dsh-pet；…」，一句话说两遍。
 - `tokens` 用 `Math.ceil(text.length / 1.8)` 估（中文一 token ≈ 1.8 字）。
 - 超预算：先砍「长期」，再砍「这轮想起来的」，再砍「短期里最老的」，
@@ -436,7 +436,7 @@ export function mergeDuplicateGroup(entries, {now, zone, taken}) -> Entry | null
 
 ## 12. `src/host/index.mjs`（host-agent）
 
-必须实现的骨架（细节看 `feiyu-memory/src/host/index.mjs`，那是验证过的范本）：
+必须实现的骨架（细节看本仓 `src/host/index.mjs`）：
 
 ```js
 export const name = 'ebbinghaus-memory';
@@ -559,27 +559,11 @@ system:
 
 ---
 
-## 15. 迁移（migrate-agent）
+## 15. 迁移（不随本仓发布）
 
-`tools/migrate.mjs`：把旧档案搬进来，**保留原始时间戳**。
-
-源（存在才读）：
-- `D:\DSH\feiyu-diary\diary\*.jsonl`（feiyu-memory 日记，有 `created_at` + `text`）
-- `D:\DSH\feiyu-diary\persona.md`、`relationship.json`（人格 → 永久）
-- `D:\DSH\dsh-home\profiles\desktop\plugins\dsh-persona-bootstrap\workspace\USER-PROFILE.md`（永久种子）
-- `D:\DSH\dsh-home\prompt-inject.md`（用户自己的话 → 永久）
-
-分区规则：
-- 有 `created_at` 且距今 ≤ `shortDays` → short
-- ≤ `longDays` → long
-- 更早 / 人格 / 习惯 → permanent
-- `weight`：人格条目 0.9；有明确项目/偏好 0.6-0.8；日常 0.35-0.55
-
-要求：`--dry-run` 默认只演不写，打出一张「将导入多少条、各区多少、时间跨度」的表；
-`--apply` 才落盘，且**先备份**到 `<dataDir>/_backup-<时间戳>/`。幂等（按 ts+title 哈希去重）。
-
----
-
+针对某个私有插件旧档案格式的迁移脚本**没有随本仓发布** —— 那东西只对原作者自己的旧数据有用。
+想把别处整理好的记忆搬进来，走 `tools/import.mjs`（见 README「导出 / 导入」）：
+**保留原始时间戳**、按「距今多久」自动分层、重复跑不会产生重复条目。
 ## 16. 验收
 
 ```bash

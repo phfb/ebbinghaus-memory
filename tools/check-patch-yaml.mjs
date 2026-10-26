@@ -2,7 +2,7 @@
 /**
  * cordis.patch.yml 校验器。
  *
- * 为什么需要这么个东西：feiyu-memory 踩过 —— cordis.patch.yml **必须是顶层 YAML 数组**。
+ * 为什么需要这么个东西：旧版插件踩过 —— cordis.patch.yml **必须是顶层 YAML 数组**。
  * 少写两根横线（写成顶层映射）时，DSH 的 loader 不会说「格式不对」，
  * 而是抛一个完全对不上号的错，人要翻半天才找到这里。
  *

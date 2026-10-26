@@ -208,7 +208,7 @@ test('跨区 id 重复会在加载时被去掉（历史粘贴事故）', async (
 
 test('mergeFromDisk：磁盘上外部新增的条目，落盘时会被合并进来而不是抹掉', async () => {
   const dir = await tmpDir('external');
-  // 模拟 migrate.mjs：另一个进程直接往磁盘写
+  // 模拟「另一个进程」直接往磁盘写
   const store = createStore({ dir });
   await store.load();
   const mine = entry({ title: '插件自己记的' });

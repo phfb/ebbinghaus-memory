@@ -28,13 +28,17 @@ function arg(name, fallback) {
 
 const dataDir =
   arg('--dir', '') ||
-  (process.env.DSH_HOME ? path.join(process.env.DSH_HOME, 'ebbinghaus-memory') : 'D:/DSH/dsh-home/ebbinghaus-memory');
+  (process.env.DSH_HOME ? path.join(process.env.DSH_HOME, 'ebbinghaus-memory') : '');
 const query = arg('--query', '');
+
+if (dataDir === '') {
+  console.log('找不到记忆库目录：请设置 DSH_HOME 环境变量，或者用 --dir 指定。');
+  process.exit(1);
+}
 
 function findCordis() {
   const candidates = [
     process.env.DSH_APP_DIR ? path.join(process.env.DSH_APP_DIR, 'node_modules') : null,
-    'D:/DSH/DSH NEXT/resources/app/node_modules',
     path.join(process.env.LOCALAPPDATA ?? '', 'Programs/DeepSeek Harness/resources/app/node_modules'),
   ].filter(Boolean);
   for (const base of candidates) {

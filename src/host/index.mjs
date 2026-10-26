@@ -1497,7 +1497,7 @@ export function apply(ctx, rawConfig) {
   /**
    * 重新从磁盘读一遍记忆库。
    *
-   * 为什么需要它：`tools/migrate.mjs` 是**另一个进程**，它往库里写完，正在跑的
+   * 为什么需要它：`tools/import.mjs` 是**另一个进程**，它往库里写完，正在跑的
    * 插件内存里还是旧副本。不重读的话，插件下一次落盘会拿旧内存整份覆盖磁盘 ——
    * 刚导入的几十条一行不剩，而且没有任何报错。
    *
@@ -2158,7 +2158,7 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
-              // 外部工具（比如 tools/migrate.mjs）改过库文件之后，调一下这个
+              // 外部工具（比如 tools/import.mjs）改过库文件之后，调一下这个
               const r = await reloadNow();
               return reply(res, 200, { ok: true, ...r });
             } catch (err) {

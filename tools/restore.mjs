@@ -42,7 +42,12 @@ function arg(name, fallback = undefined) {
 
 const APPLY = Boolean(arg('--apply', false));
 const LIST = Boolean(arg('--list', false));
-const dir = String(arg('--dir', 'D:/DSH/dsh-home/ebbinghaus-memory'));
+const DSH_HOME_DIR = (process.env.DSH_HOME ?? `).trim();
+const dir = String(arg('--dir', DSH_HOME_DIR !== '' ? path.join(DSH_HOME_DIR, 'ebbinghaus-memory') : ''));
+if (dir === '') {
+  console.error('找不到记忆库目录：请设置 DSH_HOME 环境变量，或者用 --dir 指定');
+  process.exit(1);
+}
 const wantId = typeof arg('--id', undefined) === 'string' ? arg('--id') : '';
 const wantTag = typeof arg('--tag', undefined) === 'string' ? arg('--tag') : '';
 const wantSince = typeof arg('--since', undefined) === 'string' ? arg('--since') : '';

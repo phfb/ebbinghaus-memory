@@ -285,7 +285,7 @@ permanent.jsonl
 **命令行看一眼（只演不写）：**
 
 ```powershell
-cd D:\Ebbinghaus-memory
+cd 你的克隆目录
 node tools\dedup.mjs                    # 列出会合成哪几组、省几条，不动库
 node tools\dedup.mjs --threshold 0.45   # 换个阈值看看会多合哪些
 node tools\dedup.mjs --apply            # 真合并（先自动冷存档）
@@ -316,20 +316,11 @@ node tools\dedup.mjs --apply            # 真合并（先自动冷存档）
 
 ## 迁移旧记忆
 
-```powershell
-cd D:\Ebbinghaus-memory
+仓库里**不带**针对某个私有插件旧档案格式的迁移脚本 —— 那只对原作者自己的旧数据有用。
+想把别处整理好的记忆搬进来，先按下一节做一个包，再 `node tools/import.mjs --apply <包文件>` 导入：
+**保留原始时间戳**，按「距今多久」自动分层，重复跑不会产生重复条目。
 
-# 先看，不写
-node tools\migrate.mjs --dry-run
-
-# 满意了再落盘（会自动备份到 <dataDir>\_backup-<时间戳>\）
-node tools\migrate.mjs --apply
-```
-
-会把 `D:\DSH\feiyu-diary\diary\*.jsonl`、人格档案、`USER-PROFILE.md` 搬进来，
-**保留原始时间戳**，按「距今多久」自动分到对应的层。重复跑不会产生重复条目。
-
-导完之后：插件内存里还是旧的（迁移工具是另一个进程）。**重启 DSH** 就行；
+导完之后：插件内存里还是旧的（导入工具是另一个进程）。**重启 DSH** 就行；
 不想重启也可以调一下 `POST /ebbinghaus/reload` 让它重读磁盘。
 
 有个保护是内建的：就算你没重启，插件下次落盘前也会先把磁盘上的外部新增合并进来，
@@ -347,14 +338,14 @@ node tools\migrate.mjs --apply
 node tools/export.mjs
 
 # 看会变成什么样（不写盘）
-node tools/import.mjs D:\temp\mem.json
+node tools/import.mjs 你的包文件路径
 
 # 真导入（自动备份到 <库>/_backup-<时间戳>/）
-node tools/import.mjs --apply D:\temp\mem.json
+node tools/import.mjs --apply 你的包文件路径
 ```
 
 > 这台机器 PATH 里没有 `node`，用 DSH 自带的：
-> `$env:ELECTRON_RUN_AS_NODE='1'; & 'D:\DSH\DSH NEXT\DSH NEXT.exe' D:\Ebbinghaus-memory\tools\export.mjs`
+> `$env:ELECTRON_RUN_AS_NODE='1'; & '你的DSH安装目录\DSH NEXT.exe' tools\export.mjs`
 
 **合并规则**：按 id 合并，不覆盖。同一个 id 两边都有时，`weight` 高的赢；
 weight 相同看谁 `depth` 小（更原始）；还相同取 `ts` 早的。`zone` 取更深的那个。

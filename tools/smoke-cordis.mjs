@@ -8,7 +8,7 @@
  *
  * 用法（node 不在 PATH，用全路径）：
  *
- *   & "D:\DSH\dsh-home\dsh-runtimes\dsh-next-primary-runtime\dependencies\node\bin\node.exe" tools\smoke-cordis.mjs
+ *   & "你的 node.exe" tools\smoke-cordis.mjs
  *
  * 它做三件事：
  *   1. 用 DSH 自带的 cordis 建一个 Context
@@ -29,7 +29,6 @@ const PROJECT = path.resolve(HERE, '..');
 function findCordis() {
   const candidates = [
     process.env.DSH_APP_DIR ? path.join(process.env.DSH_APP_DIR, 'node_modules') : null,
-    'D:/DSH/DSH NEXT/resources/app/node_modules',
     path.join(process.env.LOCALAPPDATA ?? '', 'Programs/DeepSeek Harness/resources/app/node_modules'),
   ].filter(Boolean);
 

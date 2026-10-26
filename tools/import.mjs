@@ -122,7 +122,7 @@ function resolveDataDir(cliDir) {
   if (typeof cliDir === 'string' && cliDir.trim() !== '') return path.resolve(cliDir.trim());
   const home = (process.env.DSH_HOME ?? '').trim();
   if (home !== '') return path.join(home, 'ebbinghaus-memory');
-  return path.join('D:/DSH/dsh-home/ebbinghaus-memory');
+  throw new Error('找不到记忆库目录：请设置 DSH_HOME 环境变量，或者用 --dir 指定');
 }
 
 async function exists(p) {
@@ -202,7 +202,7 @@ function printHelp() {
 
 选项
   --dir <path>   目标记忆库目录
-                 默认 $DSH_HOME/ebbinghaus-memory，再退回 D:/DSH/dsh-home/ebbinghaus-memory
+                 默认 $DSH_HOME/ebbinghaus-memory（没设 DSH_HOME 就得用 --dir 指定）
   --apply        真的写盘（写前自动备份到 <库目录>/_backup-<YYYYMMDD-HHmmss>/）
   --dry-run      只演不写（默认行为）
   --help, -h     这张帮助

@@ -43,9 +43,9 @@ node tools/check-patch-yaml.mjs
   存在 `<库>/settings.json`）。
 - **冷存档与恢复** —— `_archive/compressed.jsonl` / `_archive/dropped.jsonl` 保存被压缩
   和淘汰的原文，`tools/restore.mjs` 可按 tag / 时间 / 关键词 / id 捞回来。
-- **命令行工具** —— `migrate`（迁旧档案）、`export` / `import`（跨端同步）、
+- **命令行工具** —— `export` / `import`（跨端同步）、
   `restore`（冷存档恢复）、`dedup`（阈值试算）、`preview-injection`（看注入长什么样）、
-  `check-patch-yaml`（补丁校验）、`smoke-cordis`（加载冒烟）、`sync-persona`。
+  `check-patch-yaml`（补丁校验）、`smoke-cordis`（加载冒烟）。
 
 ### 设计取舍
 

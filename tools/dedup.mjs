@@ -25,12 +25,12 @@ const valueOf = (flag, fallback) => {
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : fallback;
 };
 
-/** 记忆库目录：--dir 优先，其次 $DSH_HOME，最后退回本机默认。 */
+/** 记忆库目录：--dir 优先，其次 $DSH_HOME，没设就报错让你用 --dir。 */
 function resolveDataDir(cliDir) {
   if (typeof cliDir === 'string' && cliDir.trim() !== '') return path.resolve(cliDir.trim());
   const home = (process.env.DSH_HOME ?? '').trim();
   if (home !== '') return path.join(home, 'ebbinghaus-memory');
-  return path.join('D:/DSH/dsh-home', 'ebbinghaus-memory');
+  throw new Error('找不到记忆库目录：请设置 DSH_HOME 环境变量，或者用 --dir 指定');
 }
 
 const APPLY = has('--apply');

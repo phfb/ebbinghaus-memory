@@ -908,9 +908,9 @@ test('命中多条时先列候选，用户点名后只读那一条（检索式�
       { ts: now - days * 86400000, title, detail, keywords: ['桌宠'], weight: 0.7 },
       { zone: 'short', now },
     );
-  const e1 = mkEntry(1, '桌宠第一次做', '完整细节一：feiyu-pet.ps1 用 WPF 画蓝鲸，双击会说话。');
+  const e1 = mkEntry(1, '桌宠第一次做', '完整细节一：pet-app.ps1 用 WPF 画一只猫，双击会说话。');
   const e2 = mkEntry(4, '桌宠改外形', '完整细节二：改 XAML 坐标，重转 UTF-8 BOM。');
-  const e3 = mkEntry(9, '桌宠换素材', '完整细节三：换成 DSniang2.png。');
+  const e3 = mkEntry(9, '桌宠换素材', '完整细节三：换成 icon2.png。');
   for (const e of [e1, e2, e3]) store.add(e);
   await store.save();
 

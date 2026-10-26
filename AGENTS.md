@@ -123,7 +123,7 @@ $node = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\x64\prima
 cd <克隆目录>
 & $node --test                    # 全部测试（219 个）
 & $node tools/check-patch-yaml.mjs
-& $node tools/migrate.mjs --dry-run
+& $node tools/export.mjs --help
 ```
 
 macOS / Linux 直接 `node --test` 就行，`node` 在 PATH 里。
