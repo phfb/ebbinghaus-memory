@@ -68,6 +68,10 @@ import {
   BINDINGS_FILE,
   bindIfNew,
   isValidSpaceId,
+  makeSpaceId,
+  normalizeSpaceName,
+  pruneBindings,
+  TRASH_DIR,
   parseBindings,
   resolveSessionSpace,
   spaceDirOf,
@@ -693,6 +697,91 @@ export function apply(ctx, rawConfig) {
         },
       };
     });
+  }
+
+  /** 注册表落盘（active + 分区列表）。 */
+  function persistRegistry() {
+    try {
+      writeFileSync(
+        path.join(libraryRoot, REGISTRY_FILE),
+        `${JSON.stringify({ version: 1, active: activeSpaceId, spaces: spaceInfo.spaces }, null, 2)}\n`,
+        'utf8',
+      );
+      return true;
+    } catch (err) {
+      warn(`注册表写不进去：${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  /**
+   * 新建分区。名字随便起，id 从名字自动生成（中文名会退成 space-N）。
+   * **只建目录 + 记注册表**，不切过去、不动任何已有数据。
+   */
+  function createSpace(name) {
+    const clean = normalizeSpaceName(name);
+    if (clean === '') return { ok: false, reason: '名字不能为空' };
+    const list = spaceInfo.spaces ?? [];
+    if (list.length >= 10) return { ok: false, reason: '最多 10 个分区' };
+    const id = makeSpaceId(clean, list.map((s) => s.id));
+    try {
+      mkdirSync(spaceDirOf(libraryRoot, id), { recursive: true });
+    } catch (err) {
+      return { ok: false, reason: `建目录失败：${err instanceof Error ? err.message : String(err)}` };
+    }
+    const entry = { id, name: clean, createdAt: new Date().toISOString() };
+    list.push(entry);
+    spaceInfo.spaces = list;
+    if (!persistRegistry()) return { ok: false, reason: '注册表写不进去' };
+    log(`新建分区「${clean}」（${id}）`);
+    return { ok: true, space: entry };
+  }
+
+  /**
+   * 改显示名。**id 和目录都不动** —— 所以改名永远碰不到数据，是最安全的一个操作。
+   */
+  function renameSpace(id, name) {
+    const clean = normalizeSpaceName(name);
+    if (clean === '') return { ok: false, reason: '名字不能为空' };
+    const sp = (spaceInfo.spaces ?? []).find((s) => s.id === id);
+    if (sp === undefined) return { ok: false, reason: `没有这个分区：${id}` };
+    sp.name = clean;
+    if (!persistRegistry()) return { ok: false, reason: '注册表写不进去' };
+    log(`分区改名：${id} → 「${clean}」`);
+    return { ok: true, space: sp };
+  }
+
+  /**
+   * 删分区：整个目录搬进 `_trash/<id>-<时间戳>/`，**不真删**，随时能捞回来。
+   * 至少留一个；删的是当前分区就自动切到剩下的第一个；指向它的绑定一并清掉。
+   */
+  function deleteSpace(id) {
+    const list = spaceInfo.spaces ?? [];
+    const sp = list.find((s) => s.id === id);
+    if (sp === undefined) return { ok: false, reason: `没有这个分区：${id}` };
+    if (list.length <= 1) return { ok: false, reason: '至少要留一个分区' };
+    const from = spaceDirOf(libraryRoot, id);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const to = path.join(libraryRoot, TRASH_DIR, `${id}-${stamp}`);
+    try {
+      mkdirSync(path.dirname(to), { recursive: true });
+      renameSync(from, to);
+    } catch (err) {
+      return { ok: false, reason: `搬到 _trash 失败：${err instanceof Error ? err.message : String(err)}` };
+    }
+    spaceInfo.spaces = list.filter((s) => s.id !== id);
+    const pruned = pruneBindings(bindings, spaceInfo.spaces.map((s) => s.id));
+    bindings = pruned.bindings;
+    persistBindings();
+    storePool.delete(id);
+    if (activeSpaceId === id) {
+      activeSpaceId = spaceInfo.spaces[0].id;
+      dataDir = spaceDirOf(libraryRoot, activeSpaceId);
+    }
+    if (!persistRegistry()) return { ok: false, reason: '注册表写不进去（目录已经搬到 _trash 了）' };
+    invalidateAllRenders();
+    log(`删掉分区「${sp.name}」→ _trash/${path.basename(to)}`);
+    return { ok: true, movedTo: to, active: activeSpaceId, unbound: pruned.removed };
   }
 
   /** 在某个分区的上下文里跑一段（同步或异步都行），跑完恢复。 */
@@ -2742,6 +2831,76 @@ export function apply(ctx, rawConfig) {
               persistBindings();
               invalidateRender(sessionId);
               return reply(res, 200, { ok: true, sessionId, space: id });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          kind: 'exact',
+          path: `${PANEL_BASE}/spaces/create`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              let body;
+              try {
+                body = await readBody(req);
+              } catch (err) {
+                return fail(res, 413, err);
+              }
+              const name = typeof body?.name === 'string' ? body.name : '';
+              const r = createSpace(name);
+              if (!r.ok) return reply(res, 400, { ok: false, error: r.reason });
+              return reply(res, 200, { ok: true, space: r.space, spaces: spacesPanelList() });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          kind: 'exact',
+          path: `${PANEL_BASE}/spaces/rename`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              let body;
+              try {
+                body = await readBody(req);
+              } catch (err) {
+                return fail(res, 413, err);
+              }
+              const id = typeof body?.id === 'string' ? body.id.trim() : '';
+              const name = typeof body?.name === 'string' ? body.name : '';
+              const r = renameSpace(id, name);
+              if (!r.ok) return reply(res, 400, { ok: false, error: r.reason });
+              return reply(res, 200, { ok: true, space: r.space, spaces: spacesPanelList() });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          kind: 'exact',
+          path: `${PANEL_BASE}/spaces/delete`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              let body;
+              try {
+                body = await readBody(req);
+              } catch (err) {
+                return fail(res, 413, err);
+              }
+              const id = typeof body?.id === 'string' ? body.id.trim() : '';
+              const r = deleteSpace(id);
+              if (!r.ok) return reply(res, 400, { ok: false, error: r.reason });
+              return reply(res, 200, {
+                ok: true,
+                movedTo: r.movedTo,
+                active: r.active,
+                unbound: r.unbound,
+                spaces: spacesPanelList(),
+              });
             } catch (err) {
               return fail(res, 500, err);
             }

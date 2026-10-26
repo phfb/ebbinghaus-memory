@@ -19,7 +19,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { registerHooks } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -31,6 +31,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createStore } from '../src/core/store.mjs';
 import { normalizeEntry } from '../src/core/schema.mjs';
 import { CONFIG_DEFAULTS } from '../src/core/config.mjs';
+import { isValidSpaceId } from '../src/core/spaces.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const stubDir = path.join(here, '__stubs__');
@@ -511,6 +512,9 @@ test('HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
     '/ebbinghaus/settings',
     '/ebbinghaus/spaces/active',
     '/ebbinghaus/spaces/bind',
+    '/ebbinghaus/spaces/create',
+    '/ebbinghaus/spaces/delete',
+    '/ebbinghaus/spaces/rename',
     '/ebbinghaus/spaces/unbind',
     '/ebbinghaus/state',
   ]);
@@ -1450,4 +1454,94 @@ test('多分区：切 active 之后，老会话仍留在原分区', async (t) =>
 
   const reg = JSON.parse(readFileSync(path.join(dir, 'spaces.json'), 'utf8'));
   assert.equal(reg.active, 'work', '注册表里的 active 也要跟着改');
+});
+
+/* ─────────────────── 分区管理：新建 / 改名 / 删除 ─────────────────── */
+
+/** 调一次 POST 路由，返回 {status, body}。 */
+async function callPost(h, p, body) {
+  const route = h.route(p);
+  assert.ok(route, `要有 ${p} 路由`);
+  const res = fakeRes();
+  await route.handler(fakeReq({ method: 'POST', url: p, body }), res);
+  return { status: res.statusCode, body: res.json() };
+}
+
+test('分区管理：新建 / 改名 / 删除', async (t) => {
+  const dir = await tempDir();
+  t.after(async () => {
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔目录句柄还没释放，清理失败不影响测试结论
+    }
+  });
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '他在做记忆插件')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  // ① 新建
+  const created = await callPost(h, '/ebbinghaus/spaces/create', { name: '工作' });
+  assert.equal(created.body.ok, true, JSON.stringify(created.body));
+  const newId = created.body.space.id;
+  assert.equal(isValidSpaceId(newId), true, 'id 要合法');
+  assert.equal(existsSync(path.join(dir, 'spaces', newId)), true, '目录要建出来');
+
+  const reg1 = JSON.parse(readFileSync(path.join(dir, 'spaces.json'), 'utf8'));
+  assert.equal(reg1.spaces.length, 2);
+  assert.ok(reg1.spaces.some((s) => s.id === newId && s.name === '工作'));
+
+  // ② 改名（id 和目录都不该动）
+  const renamed = await callPost(h, '/ebbinghaus/spaces/rename', { id: newId, name: '干活用' });
+  assert.equal(renamed.body.ok, true);
+  assert.equal(renamed.body.space.name, '干活用');
+  assert.equal(renamed.body.space.id, newId, '改名不许换 id');
+  assert.equal(existsSync(path.join(dir, 'spaces', newId)), true, '目录也不许动');
+
+  // ③ 不能删最后一个
+  const del0 = await callPost(h, '/ebbinghaus/spaces/delete', { id: 'private' });
+  // 这时还有两个，能删；先删 private 之外的那个，再试删最后一个
+  assert.equal(del0.status, 200, '还有两个分区时允许删');
+
+  const reg2 = JSON.parse(readFileSync(path.join(dir, 'spaces.json'), 'utf8'));
+  assert.equal(reg2.spaces.length, 1);
+  assert.equal(reg2.active, reg2.spaces[0].id, '删掉当前分区要自动切到剩下的');
+
+  const last = reg2.spaces[0].id;
+  const del1 = await callPost(h, '/ebbinghaus/spaces/delete', { id: last });
+  assert.equal(del1.status, 400, '最后一个不许删');
+  assert.match(String(del1.body.error), /至少|留一个/);
+
+  // ④ 删掉的目录搬进 _trash（不真删）
+  const trash = path.join(dir, '_trash');
+  assert.equal(existsSync(trash), true, '要建 _trash');
+  const moved = readdirSync(trash);
+  assert.equal(moved.length, 1, '搬过去一份');
+  assert.ok(String(moved[0]).startsWith('private'), '被删的是 private，_trash 里的目录名要带它的 id');
+});
+
+test('分区管理：新建超过 10 个会被拒', async (t) => {
+  const dir = await tempDir();
+  t.after(async () => {
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔目录句柄还没释放，清理失败不影响测试结论
+    }
+  });
+
+  const llm = makeLlm({ text: modelJson([]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  // 已经有了 1 个，再加 9 个到顶
+  for (let i = 1; i <= 9; i += 1) {
+    const r = await callPost(h, '/ebbinghaus/spaces/create', { name: `分区${i}` });
+    assert.equal(r.body.ok, true, `第 ${i} 个应该能建`);
+  }
+  const over = await callPost(h, '/ebbinghaus/spaces/create', { name: '再来一个' });
+  assert.equal(over.status, 400);
+  assert.match(String(over.body.error), /10/);
 });

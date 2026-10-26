@@ -1094,6 +1094,8 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState('');
       const [notice, setNotice] = useState('');
       const [busy, setBusy] = useState('');
+      /** 分区操作的小表单：{ mode: "create"|"rename"|"delete", value, id } */
+      const [spaceOp, setSpaceOp] = useState(null);
       const [tick, setTick] = useState(0);
       // 输入框里正在打的字 与 已经提交给 host 的关键词分开：
       // 合成一个的话，每敲一个字都会打一次接口。
@@ -1341,6 +1343,36 @@ window.__ModuleLoader__.load({
        * **只影响之后新开的对话** —— 已经聊着的会话按绑定走，记忆不会换人。
        * @param {string} id
        */
+      /** 提交分区操作（新建 / 改名 / 删除共用一个表单）。 */
+      function submitSpaceOp() {
+        if (!spaceOp) return;
+        const op = spaceOp;
+        const path =
+          op.mode === 'create'
+            ? '/spaces/create'
+            : op.mode === 'rename'
+              ? '/spaces/rename'
+              : '/spaces/delete';
+        const body =
+          op.mode === 'create'
+            ? { name: op.value }
+            : op.mode === 'rename'
+              ? { id: op.id, name: op.value }
+              : { id: op.id };
+        setBusy('分区');
+        postJson(path, body)
+          .then((r) => {
+            setBusy('');
+            setSpaceOp(null);
+            if (r && r.ok === false) setSettingsNotice(`分区操作没成功：${r.error || '未知原因'}`);
+            reload();
+          })
+          .catch((err) => {
+            setBusy('');
+            setSettingsNotice(`分区操作没成功：${String((err && err.message) || err)}`);
+          });
+      }
+
       function switchSpace(id) {
         const target = typeof id === 'string' ? id.trim() : '';
         if (target === '') return;
@@ -1692,6 +1724,8 @@ window.__ModuleLoader__.load({
             const sp = isObj(d.spaces) ? d.spaces : null;
             const list = sp && Array.isArray(sp.list) ? sp.list : [];
             if (list.length === 0) return null;
+            const cur = list.find((x) => x.id === sp.active) ?? list[0];
+            const curName = cur ? cur.name : sp.active;
             const fmt = (s) =>
               `${s.name}（短 ${num(s.counts && s.counts.short, 0)} · 长 ${num(s.counts && s.counts.long, 0)} · 永 ${num(
                 s.counts && s.counts.permanent,
@@ -1724,8 +1758,70 @@ window.__ModuleLoader__.load({
                 { style: { fontSize: 11, color: C.text2 } },
                 '切换只影响新开的对话；已经聊着的会话留在原分区',
               ),
+              h('button', {
+                type: 'button',
+                onClick: () => setSpaceOp({ mode: 'create', value: '', id: null }),
+                disabled: busy,
+                style: chipStyle(C.text2, busy),
+              }, '新建'),
+              h('button', {
+                type: 'button',
+                onClick: () =>
+                  setSpaceOp({ mode: 'rename', value: curName, id: sp.active }),
+                disabled: busy,
+                style: chipStyle(C.text2, busy),
+              }, '改名'),
+              h('button', {
+                type: 'button',
+                onClick: () =>
+                  setSpaceOp({ mode: 'delete', value: curName, id: sp.active }),
+                disabled: busy,
+                style: chipStyle(C.text2, busy),
+              }, '删除'),
             );
           })(),
+
+          spaceOp
+            ? h(
+                'div',
+                {
+                  style: {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    marginBottom: 14,
+                    flexWrap: 'wrap',
+                  },
+                },
+                spaceOp.mode === 'delete'
+                  ? h(
+                      'span',
+                      { style: { fontSize: 12, color: C.text2 } },
+                      `确认删掉「${spaceOp.value}」？整个目录会搬到 _trash，不真删`,
+                    )
+                  : h('input', {
+                      type: 'text',
+                      value: spaceOp.value,
+                      'aria-label': '分区名字',
+                      placeholder: '分区叫什么（最多 24 字）',
+                      onChange: (ev) =>
+                        setSpaceOp({ ...spaceOp, value: ev && ev.target ? String(ev.target.value) : '' }),
+                      style: { ...settingInputStyle(), minWidth: 200 },
+                    }),
+                h('button', {
+                  type: 'button',
+                  onClick: submitSpaceOp,
+                  disabled: busy === '分区',
+                  style: chipStyle(C.brand, busy === '分区'),
+                }, spaceOp.mode === 'delete' ? '确认删除' : '确定'),
+                h('button', {
+                  type: 'button',
+                  onClick: () => setSpaceOp(null),
+                  disabled: busy,
+                  style: chipStyle(C.text2, busy),
+                }, '取消'),
+              )
+            : null,
 
           h(Section, { title: '记忆库自检' }, dedupBody),
 
