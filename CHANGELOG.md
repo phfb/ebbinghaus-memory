@@ -12,6 +12,29 @@ node tools/check-patch-yaml.mjs
 
 ---
 
+## [0.7.0] - 2026-10-26
+
+### 新增：两个迁移 / 同步工具（`tools/`）
+
+- **`tools/migrate.mjs`** —— 把散落在旧日记（jsonl）、`persona.md`、`USER-PROFILE.md`、
+  `relationship.json` 里的档案一次性搬进三分区。
+  - 时间戳沿用原始记忆自带的 `created_at`，不按导入时刻算 ——
+    否则旧记忆全变成「今天刚发生」，遗忘曲线当场失效
+  - 幂等：`sha1(ts + '|' + title)` 去重，同一条重跑一次直接跳过
+  - 默认 `--dry-run`，`--apply` 之前先备份；只 import `src/core` 里已冻结的实现，
+    不另写一套字段名和 jsonl 格式
+  - 默认读 `$LEGACY_MEMORY_DIR`（缺省 `~/legacy-diary`），目标库用 `--dir` 指定或走
+    `$DSH_HOME/ebbinghaus-memory`
+
+- **`tools/sync-persona.mjs`** —— 永久记忆区 → `AGENT.md` 的反向同步。
+  - 自动发现所有以 `人格·` 开头的永久区条目，**不写死清单**
+    （顺序 = 库里条目顺序，想让某节靠前就调库里顺序）
+  - 拼成 Markdown 写进 `AGENT.md`（幂等：内容没变就不重写、不产备份），
+    同时把这些条目 weight 压到 0.1，让它们不再占注入名额
+  - 默认读 `$EBBINGHAUS_DIR` / 写 `$AGENT_MD`（缺省 `~/ebbinghaus-memory` 和 `~/AGENT.md`）
+
+两个脚本都不带任何用户数据，路径全部走环境变量。
+
 ## [0.6.1] - 2026-10-26
 
 ### 改进（多分区用得上的小东西）
