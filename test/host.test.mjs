@@ -1716,3 +1716,160 @@ test('连续失败会在 memory_stats 里带 ⚠ 提示（单次失败时不带�
   last = out.lines[out.lines.length - 1];
   assert.match(last, /已连续 2 次没写进去/, '连续失败必须显式说出来');
 });
+
+/* ── 2026-10-27：固化链路兜底（失败切官方，存成功切回） ── */
+
+/** 建一个「按次数给不同输出」的 llm：指定次数之前吐坏文本，之后吐正常条目。 */
+function chainLlm(badTimes, now) {
+  return makeLlm((opts, n) =>
+    n <= badTimes
+      ? { text: '好的，我先讲讲我的想法：今天天气不错，晚饭想吃什么' }
+      : { text: modelJson([sampleItem(now - 60_000, `第 ${n} 次固化`)]) },
+  );
+}
+
+test('连续失败到阈值 → 切官方兜底；兜底存成功 → 切回聊天模型', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  const llm = chainLlm(3, now);
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    provider: 'unlimit',
+    model: 'deepseek-v4.1-flash',
+    fallbackEnabled: true,
+    fallbackAfter: 3,
+    fallbackProvider: 'deepseek-account',
+    fallbackModel: 'deepseek-flash',
+  });
+
+  const agent = makeAgent('sess-chain', h.sections);
+  h.emit('agent/created', { agent });
+  const say = async (text) => {
+    h.emit('session/event', { id: 'sess-chain' }, {
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text }] },
+    });
+    h.emit('agent/turn-stopping', { agent });
+    await h.services.get('ebbinghausMemory').flush();
+  };
+
+  for (let i = 1; i <= 3; i += 1) {
+    await say(`第 ${i} 轮`);
+    assert.equal(llm.calls[i - 1].provider, 'unlimit', `第 ${i} 次还在主链路`);
+  }
+
+  // 第 4 次：已经切到兜底，而且这次模型正常 → 存进去了
+  await say('第 4 轮');
+  assert.equal(llm.calls[3].provider, 'deepseek-account', '到阈值后必须切兜底');
+  assert.equal(llm.calls[3].model, 'deepseek-flash');
+
+  // 存成功算「好了」→ 第 5 次切回聊天模型
+  await say('第 5 轮');
+  assert.equal(llm.calls[4].provider, 'unlimit', '兜底存成功后必须切回聊天模型');
+});
+
+test('切回后的冷静期内即使失败，也不立刻再切兜底（防来回抖）', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  // 前 3 次坏 → 第 4 次（兜底）好 → 第 5 次起又坏
+  const llm = makeLlm((opts, n) => {
+    if (n <= 3) return { text: '不是 JSON' };
+    if (n === 4) return { text: modelJson([sampleItem(now - 60_000, '兜底存的')]) };
+    return { text: '又不是 JSON' };
+  });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    provider: 'unlimit',
+    model: 'deepseek-v4.1-flash',
+    fallbackEnabled: true,
+    fallbackAfter: 3,
+    fallbackProvider: 'deepseek-account',
+    fallbackModel: 'deepseek-flash',
+    fallbackCooldownSeconds: 600,
+  });
+
+  const agent = makeAgent('sess-cool', h.sections);
+  h.emit('agent/created', { agent });
+  const say = async (text) => {
+    h.emit('session/event', { id: 'sess-cool' }, {
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text }] },
+    });
+    h.emit('agent/turn-stopping', { agent });
+    await h.services.get('ebbinghausMemory').flush();
+  };
+
+  for (let i = 1; i <= 5; i += 1) await say(`第 ${i} 轮`);
+
+  // 第 5 次已经切回主链路且失败，但处在冷静期 → 仍走主链路，不再切兜底
+  assert.equal(llm.calls[4].provider, 'unlimit');
+  await say('第 6 轮');
+  assert.equal(llm.calls[5].provider, 'unlimit', '冷静期内不该再切兜底');
+});
+
+test('关掉兜底开关后，失败多少次都不切链路', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const llm = chainLlm(99, Date.now());
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    provider: 'unlimit',
+    model: 'deepseek-v4.1-flash',
+    fallbackEnabled: false,
+    fallbackAfter: 2,
+    fallbackProvider: 'deepseek-account',
+    fallbackModel: 'deepseek-flash',
+  });
+
+  const agent = makeAgent('sess-nofb', h.sections);
+  h.emit('agent/created', { agent });
+  for (let i = 1; i <= 4; i += 1) {
+    h.emit('session/event', { id: 'sess-nofb' }, {
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: `第 ${i} 轮` }] },
+    });
+    h.emit('agent/turn-stopping', { agent });
+    await h.services.get('ebbinghausMemory').flush();
+  }
+  assert.equal(llm.calls.length, 4);
+  for (const c of llm.calls) assert.equal(c.provider, 'unlimit', '开关关着就不该切');
+});
+
+test('固化日志记在面板数据里（只记形状，不记正文）', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '记一条')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const agent = makeAgent('sess-log', h.sections);
+  h.emit('agent/created', { agent });
+  h.emit('session/event', { id: 'sess-log' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '这句正文不该出现在日志里' }] },
+  });
+  h.emit('agent/turn-stopping', { agent });
+  await h.services.get('ebbinghausMemory').flush();
+
+  const snap = await h.services.get('ebbinghausMemory').state();
+  const log = snap?.consolidate?.log;
+  assert.ok(Array.isArray(log) && log.length >= 1, '固化日志应该有一条');
+  const last = log[log.length - 1];
+  assert.equal(last.outcome, 'ok');
+  assert.ok(typeof last.at === 'number');
+  assert.ok(!JSON.stringify(last).includes('这句正文不该出现在日志里'), '日志里不能出现对话正文');
+  assert.equal(snap.consolidate.chain.fallbackActive, false);
+});

@@ -1284,11 +1284,89 @@ export function apply(ctx, rawConfig) {
    */
   let consecutiveFailures = 0;
 
+  /* ── 固化链路：主（跟随聊天模型）/ 兜底（官方）───────────────────── */
+
+  /** 是否临时切到了兜底链路。只有 `evaluateChain` 会翻它。 */
+  let fallbackActive = false;
+  /** 最近一次「兜底成功、切回主链路」的时间 —— 冷静期起点。 */
+  let fallbackRecoveredAt = 0;
+  /** 最近一次真正发起模型调用的时间 —— 最小间隔用（压缩也算）。 */
+  let lastModelCallAt = 0;
+
+  /** 固化日志（环形）：面板上那个小框读的就是它。只留结果，不留正文。 */
+  const consolidateLog = [];
+  const CONSOLIDATE_LOG_MAX = 30;
+
+  /**
+   * 记一条固化日志。**只记形状**：时间、结果、模型、条数、耗时。
+   * 对话正文一个字节都不进来（这条纪律见 SPEC §17）。
+   */
+  function pushConsolidateLog(entry) {
+    consolidateLog.push(entry);
+    if (consolidateLog.length > CONSOLIDATE_LOG_MAX) {
+      consolidateLog.splice(0, consolidateLog.length - CONSOLIDATE_LOG_MAX);
+    }
+  }
+
+  /**
+   * 链路判定：主链路连续失败到阈值 → 切兜底；兜底存成功一次 → 切回主链路。
+   *
+   * 冷静期（`fallbackCooldownSeconds`，默认 10 分钟）是为了防抖：切回主链路后
+   * 立刻又失败的话，按「连续失败」算会马上再切过去，一来一回变成两个模型轮流
+   * 挨打，还不如让它在主链路上多待一会儿。冷静期内**只记账不判失败**。
+   */
+  function evaluateChain(outcome, added) {
+    if (!config.fallbackEnabled) return;
+    const now = Date.now();
+    const cooldownMs = Math.max(60, Number(config.fallbackCooldownSeconds) || 600) * 1000;
+
+    if (!fallbackActive) {
+      // 刚切回来还在冷静期：这段失败不计入判定
+      if (fallbackRecoveredAt !== 0 && now - fallbackRecoveredAt < cooldownMs) return;
+      const threshold = Math.min(10, Math.max(2, Math.round(Number(config.fallbackAfter) || 3)));
+      if (consecutiveFailures >= threshold) {
+        fallbackActive = true;
+        log(
+          `主链路连续失败 ${consecutiveFailures} 次，固化临时切到兜底 ${config.fallbackProvider}/${config.fallbackModel}`,
+        );
+      }
+      return;
+    }
+
+    // 兜底中：真的存进去了才算「好了」（用户口径：固化并存入完成）
+    if (outcome === 'ok' && added > 0) {
+      fallbackActive = false;
+      fallbackRecoveredAt = now;
+      consecutiveFailures = 0;
+      log('兜底链路存成功，切回聊天模型（冷静期内不再判定失败）');
+    }
+  }
+
+  /** 最小间隔还没到？到点之前不排新的固化任务。 */
+  function minIntervalBlocked() {
+    const sec = Number(config.minIntervalSeconds);
+    if (!Number.isFinite(sec) || sec <= 0) return false;
+    return lastModelCallAt !== 0 && Date.now() - lastModelCallAt < sec * 1000;
+  }
+
   /** @param {string} outcome @param {number} [added] */
   function noteAttempt(outcome, added = 0) {
     lastAttempt = { at: Date.now(), outcome, added, total: store.all().length };
     if (outcome === 'ok') consecutiveFailures = 0;
     else if (FAILURE_OUTCOMES.includes(outcome)) consecutiveFailures += 1;
+    pushConsolidateLog({
+      at: lastAttempt.at,
+      outcome,
+      added,
+      failures: consecutiveFailures,
+      fallback: fallbackActive,
+      total: lastAttempt.total,
+    });
+    try {
+      evaluateChain(outcome, added);
+    } catch (err) {
+      warn(`链路判定失败：${err instanceof Error ? err.message : String(err)}`);
+    }
     return undefined;
   }
 
@@ -1411,6 +1489,8 @@ export function apply(ctx, rawConfig) {
 
       const s = stateOf(id);
       if (s.turn === 0 || s.lastUserText === '') return;
+      // 一键暂停：额度被打爆时先按住这里
+      if (config.modelCallsPaused) return;
 
       const every = Math.max(1, Math.floor(Number(config.writeEveryTurns) || 1));
       // 这个会话还一次都没写过 → 第一轮就写。
@@ -1418,6 +1498,13 @@ export function apply(ctx, rawConfig) {
       // 第 1 轮 1 - 0 = 1 < 2，然后会话就结束了，那条话白说了。
       const firstWrite = s.lastWriteTurn === 0;
       if (!firstWrite && s.turn - s.lastWriteTurn < every) return;
+      // 最小间隔：连着几轮疯狂触发时把节奏压下来（省额度、也少撞并发）。
+      // 只拦非首次 —— 新会话第一句话必须记得上，这条不能被间隔吃掉。
+      // 注意这里**不更新 lastWriteTurn**：这轮先不排，下一轮还会再试。
+      if (!firstWrite && minIntervalBlocked()) {
+        log('固化间隔未到，这轮先不排');
+        return;
+      }
 
       s.lastWriteTurn = s.turn;
       log(`开闸（第 ${s.turn} 轮${firstWrite ? '，本会话首次' : ''}），排队固化`);
@@ -1436,12 +1523,20 @@ export function apply(ctx, rawConfig) {
   function modelRoute() {
     const llm = ctx.get('llm');
     if (llm === undefined || llm === null || typeof llm.stream !== 'function') return null;
+    // 兜底链路优先：它就是为「主链路吐不出条目」准备的
+    if (fallbackActive) {
+      const fp = typeof config.fallbackProvider === 'string' ? config.fallbackProvider.trim() : '';
+      const fm = typeof config.fallbackModel === 'string' ? config.fallbackModel.trim() : '';
+      if (fp !== '' && fm !== '') return { llm, provider: fp, model: fm, viaFallback: true };
+      // 兜底没配好就别硬撑，直接回主链路
+      fallbackActive = false;
+    }
     const selection = ctx.get('agentDefaultModel')?.currentSelection?.() ?? undefined;
     const provider = config.provider || selection?.provider;
     const model = config.model || selection?.model || 'deepseek-flash';
     if (typeof provider !== 'string' || provider === '') return null;
     if (typeof model !== 'string' || model === '') return null;
-    return { llm, provider, model };
+    return { llm, provider, model, viaFallback: false };
   }
 
   /**
@@ -1520,6 +1615,11 @@ export function apply(ctx, rawConfig) {
       log('记忆库没就绪，跳过这次固化');
       return;
     }
+    // 一键暂停（不记成失败：这是人按下的，不是链路坏了）
+    if (config.modelCallsPaused) {
+      log('记忆模型调用已暂停（modelCallsPaused），跳过这次固化');
+      return;
+    }
     const s = stateOf(sessionId);
     const route = modelRoute();
     if (route === null) {
@@ -1543,6 +1643,7 @@ export function apply(ctx, rawConfig) {
      * @param {number} maxTokens
      */
     async function callOnce(maxTokens) {
+      lastModelCallAt = Date.now();
       const payload = (fn) => fn({
         system: CONSOLIDATE_SYSTEM,
         messages: [
@@ -1816,9 +1917,11 @@ export function apply(ctx, rawConfig) {
   async function compressOnce(zone, group, sig) {
     // ① 先让模型压；② 失败/被截断就本地兜底 —— 兜底**永远能出一条**
     let entry = null;
-    const route = modelRoute();
+    // 暂停时不调模型，直接走本地合并（压缩照做，只是压得糙一点）
+    const route = config.modelCallsPaused ? null : modelRoute();
     if (route !== null) {
       try {
+        lastModelCallAt = Date.now();
         entry = await compressWithModel(group, {
           stream: makeStream({ llm: route.llm, provider: route.provider, model: route.model, signal: sig }),
           provider: route.provider,
@@ -2404,7 +2507,11 @@ export function apply(ctx, rawConfig) {
     // 连着两次以上才提示：单次失败可能只是「模型这次判断没什么值得记的」，
     // 但连续失败一定是链路坏了 —— 而这两种情况以前在界面上长得一模一样。
     const streak = consecutiveFailures >= 2 ? ` · ⚠ 已连续 ${consecutiveFailures} 次没写进去` : '';
-    return `上次固化：${when} · ${label}${streak}`;
+    const chain = fallbackActive
+      ? ` · 已切到兜底 ${config.fallbackProvider}/${config.fallbackModel}`
+      : '';
+    const paused = config.modelCallsPaused ? ' · 已暂停模型调用' : '';
+    return `上次固化：${when} · ${label}${streak}${chain}${paused}`;
   }
 
   /**
@@ -2667,6 +2774,26 @@ export function apply(ctx, rawConfig) {
       mirror: mirrorPanelState(),
       // 记忆库自检的进度（面板上「上次自检」那一行）
       dedup: dedupPanelState(),
+      // 固化日志（面板上那个小框）。**只给形状**：时间 / 结果 / 条数 / 链路，
+      // 不含对话正文、不含记忆内容。最近 30 次，环形。
+      consolidate: {
+        log: consolidateLog.slice(),
+        chain: {
+          fallbackActive,
+          primaryProvider: config.provider || '',
+          primaryModel: config.model || '跟随聊天模型',
+          fallbackProvider: config.fallbackProvider || '',
+          fallbackModel: config.fallbackModel || '',
+          fallbackEnabled: config.fallbackEnabled,
+          after: config.fallbackAfter,
+          consecutiveFailures,
+          recoveredAt: fallbackRecoveredAt,
+          cooldownSeconds: config.fallbackCooldownSeconds,
+          paused: config.modelCallsPaused,
+          minIntervalSeconds: config.minIntervalSeconds,
+          writeEveryTurns: config.writeEveryTurns,
+        },
+      },
       config: {
         shortDays: config.shortDays,
         longDays: config.longDays,

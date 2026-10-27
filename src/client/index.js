@@ -89,6 +89,9 @@ window.__ModuleLoader__.load({
       { title: '周期与写入频率', keys: ['shortDays', 'longDays', 'writeEveryTurns'] },
       { title: '每轮载入几条', keys: ['loadShortCount', 'loadLongRandom', 'loadPermanentCount'] },
       { title: '自动备份镜像（记忆 + 人格 + 配置）', keys: ['mirrorEnabled', 'mirrorEveryEntries', 'mirrorDir', 'mirrorExtraPaths'] },
+      // 2026-10-27：频率和链路兜底。这几项都直接决定固化调模型的次数 ——
+      // 调得越密，Token 花得越多，所以标题里就把话说明白。
+      { title: '固化频率与链路兜底（会消耗 Token）', keys: ['minIntervalSeconds', 'fallbackEnabled', 'fallbackAfter', 'fallbackCooldownSeconds', 'modelCallsPaused'] },
     ];
 
     /**
@@ -1560,6 +1563,68 @@ window.__ModuleLoader__.load({
         dedupText = bits.join(' · ');
       }
 
+      /* 固化日志：只给形状（时间 / 结果 / 条数 / 链路），不含对话正文 */
+      const chainInfo = isObj(d.consolidate) && isObj(d.consolidate.chain) ? d.consolidate.chain : {};
+      const logRows =
+        isObj(d.consolidate) && Array.isArray(d.consolidate.log)
+          ? d.consolidate.log.slice(-12).reverse()
+          : [];
+      const outcomeText = (o) =>
+        ({
+          ok: '入库',
+          'no-model': '没模型',
+          'model-error': '调用出错',
+          truncated: '被截断',
+          empty: '正文为空',
+          'parse-failed': '解析失败',
+          'nothing-worth': '判断不值得记',
+          'no-valid': '校验没过',
+        }[o] ?? String(o));
+      const hhmm = (ms) => {
+        const dt = new Date(Number(ms) || 0);
+        const p2 = (n) => String(n).padStart(2, '0');
+        return `${p2(dt.getHours())}:${p2(dt.getMinutes())}`;
+      };
+      const consolidateBody = h(
+        'div',
+        null,
+        h(
+          'p',
+          { style: { margin: '0 0 8px', fontSize: 11, color: C.text2, lineHeight: 1.75 } },
+          chainInfo.fallbackActive
+            ? `当前链路：临时切到兜底 ${chainInfo.fallbackProvider || '?'}/${chainInfo.fallbackModel || '?'}（已连续失败 ${num(
+                chainInfo.consecutiveFailures,
+                0,
+              )} 次，存成功一次就自动切回聊天模型）`
+            : `当前链路：跟随聊天模型${
+                chainInfo.paused ? ' · 已暂停模型调用' : ''
+              }${chainInfo.fallbackEnabled ? ` · 连续失败 ${num(chainInfo.after, 3)} 次自动切官方` : ' · 兜底关着'}`,
+        ),
+        logRows.length === 0
+          ? h(Empty, { text: `还没有固化记录。攒够 ${num(chainInfo.writeEveryTurns, 2)} 轮对话会写第一条。` })
+          : h(
+              'div',
+              {
+                style: {
+                  display: 'grid',
+                  gap: 2,
+                  fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+                  fontSize: 11,
+                  color: C.text2,
+                },
+              },
+              logRows.map((r, i) =>
+                h(
+                  'div',
+                  { key: `cl-${i}` },
+                  `${hhmm(r.at)} · ${outcomeText(r.outcome)}${
+                    num(r.added, 0) > 0 ? ` +${num(r.added, 0)} 条` : ''
+                  }${r.fallback ? ' · 兜底' : ''}${num(r.failures, 0) >= 2 ? ` · 连败 ${num(r.failures, 0)}` : ''}`,
+                ),
+              ),
+            ),
+      );
+
       const dedupBody = h(
         'div',
         null,
@@ -1837,6 +1902,8 @@ window.__ModuleLoader__.load({
                 }, '取消'),
               )
             : null,
+
+          h(Section, { title: '固化日志' }, consolidateBody),
 
           h(Section, { title: '记忆库自检' }, dedupBody),
 

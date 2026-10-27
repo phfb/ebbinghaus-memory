@@ -41,7 +41,11 @@ export const CONFIG_SPEC = [
   { key: 'longDays', type: 'number', default: 28, min: 2, max: 365, step: 1, label: '长期记忆周期（天）' },
 
   // ── 写入频率 ─────────────────────────────────────────────────────
-  { key: 'writeEveryTurns', type: 'number', default: 2, min: 1, max: 20, step: 1, label: '每几轮对话写一次（会话第一轮必写）' },
+  { key: 'writeEveryTurns', type: 'number', default: 2, min: 1, max: 30, step: 1, label: '每几轮对话固化一次（1-30 轮，会话第一轮必写）· 频率越高越费 Token' },
+  // 两次固化之间的最小间隔：防「连着几轮疯狂触发」把并发和额度一起打爆。
+  // **默认 0 = 不限制**，保持「攒够 writeEveryTurns 轮就写」的既有语义；
+  // 想降频（比如怕被 API 风控）就调到 60~300。
+  { key: 'minIntervalSeconds', type: 'number', default: 0, min: 0, max: 900, step: 5, label: '两次固化最小间隔（秒）· 0 = 不限制；调大能降频省额度' },
 
   // ── 分区容量（条），超了就回滚压缩 ────────────────────────────────
   { key: 'shortCapacity', type: 'number', default: 120, min: 5, max: 2000, step: 1, label: '短期容量上限（条）' },
@@ -66,7 +70,7 @@ export const CONFIG_SPEC = [
   { key: 'loadShortCount', type: 'number', default: 12, min: 0, max: 200, step: 1, label: '每轮载入短期几条' },
   { key: 'loadLongRandom', type: 'number', default: 3, min: 0, max: 50, step: 1, label: '每轮随机忆起长期几条' },
   { key: 'loadPermanentCount', type: 'number', default: 3, min: 0, max: 50, step: 1, label: '每轮载入永久几条' },
-  { key: 'budgetTokens', type: 'number', default: 1400, min: 200, max: 8000, step: 1, label: '注入预算（token）' },
+  { key: 'budgetTokens', type: 'number', default: 1400, min: 200, max: 8000, step: 1, label: '注入预算（token）· 每轮聊天都会带上这段，调大同时增加聊天输入花费' },
 
   // ── 升级 / 淘汰门槛 ──────────────────────────────────────────────
   { key: 'promoteShortToLong', type: 'number', default: 0.55, min: 0, max: 1, step: 0.05, label: '短期→长期的权重门槛' },
@@ -114,11 +118,23 @@ export const CONFIG_SPEC = [
   },
 
   // ── 固化用模型 ───────────────────────────────────────────────────
-  { key: 'provider', type: 'string', default: '', label: '固化用 provider（留空 = 跟随默认）' },
-  { key: 'model', type: 'string', default: '', label: '固化用模型（留空 = deepseek-flash）' },
+  { key: 'provider', type: 'string', default: '', label: '固化用 provider（留空 = 跟随聊天模型）' },
+  { key: 'model', type: 'string', default: '', label: '固化用模型（留空 = 跟随聊天模型）' },
   { key: 'reasoningEffort', type: 'string', default: 'off', label: '固化的思考档位（保持 off）' },
-  { key: 'maxTokens', type: 'number', default: 1200, min: 200, max: 8000, step: 1, label: '固化最大输出 token' },
+  { key: 'maxTokens', type: 'number', default: 1200, min: 200, max: 8000, step: 1, label: '固化最大输出 token · 调大只影响固化的花费，不吃聊天上下文' },
   { key: 'jobTimeoutMs', type: 'number', default: 60000, min: 5000, max: 600000, step: 1000, label: '后台任务超时（毫秒）' },
+
+  // ── 固化链路兜底（2026-10-27 加）─────────────────────────────────
+  // 主链路 = 跟随聊天模型；聊天模型那边不听话（吐不出合法条目）时，
+  // 连续失败到阈值就把固化临时切到官方模型，存成功一次算「好了」，
+  // 再切回聊天模型。切回后先稳定一段冷静期才重新计数，免得来回抖。
+  { key: 'fallbackEnabled', type: 'boolean', default: true, label: '固化连续失败就临时切到官方模型 · 存成功一次后自动切回聊天模型' },
+  { key: 'fallbackAfter', type: 'number', default: 3, min: 2, max: 10, step: 1, label: '连续失败几次切链路（2-10 次）· 越小越早切、也越容易被误判' },
+  { key: 'fallbackProvider', type: 'string', default: 'deepseek-account', label: '兜底 provider（官方）' },
+  { key: 'fallbackModel', type: 'string', default: 'deepseek-flash', label: '兜底模型（官方）' },
+  { key: 'fallbackCooldownSeconds', type: 'number', default: 600, min: 60, max: 7200, step: 60, label: '切回聊天模型后的冷静期（秒）· 期间不再判定失败' },
+  // 一键停：记忆插件彻底不调模型（不固化、不压缩）。额度被打爆时先按住这里。
+  { key: 'modelCallsPaused', type: 'boolean', default: false, label: '暂停记忆插件的模型调用（不固化、不压缩，纯本地功能照常）' },
 
   // ── 自动备份镜像（2026-10-26 加）─────────────────────────────────
   // 「每 N 条同步一次」的口径跟 dedup 一样：自上次同步以来**新写进库**的条数。
@@ -233,6 +249,14 @@ export const TUNABLE_KEYS = Object.freeze([
   'mirrorEveryEntries',
   'mirrorDir',
   'mirrorExtraPaths',
+  // 2026-10-27：固化频率与链路兜底。这几项是「每个分区各自的写入策略」，
+  // 所以放在按分区覆盖的白名单里；`fallbackProvider` / `fallbackModel` 故意
+  // **不**进来 —— 跟 provider / model 一样是全局的，只在 DSH 设置页或 yml 里改。
+  'minIntervalSeconds',
+  'fallbackEnabled',
+  'fallbackAfter',
+  'fallbackCooldownSeconds',
+  'modelCallsPaused',
 ]);
 
 /** @type {Record<string, ConfigField>} */
