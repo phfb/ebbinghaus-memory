@@ -880,18 +880,74 @@ window.__ModuleLoader__.load({
     const est = avg > 0 ? Math.round(n * avg) : 0
     const pct = budget > 0 && est > 0 ? Math.round((est / budget) * 100) : 0
     const detail = `短 ${nShort} / 长 ${nLong} / 永 ${nPerm} + 老 ${nPermSec}`
-    const text =
-      est > 0
-        ? `按现在的设置：每轮最多带 ${n} 条（${detail}），估算约 ${est} token，占注入上限 ${budget > 0 ? `${budget} token 的 ${pct}%` : '（未设）'}` +
-          (pct >= 100 ? ' —— 超了，多出来的会被预算裁掉' : '')
-        : `按现在的设置：每轮最多带 ${n} 条（${detail}）；库里还没有可估价的条目，算不出 token`
+    const over = budget > 0 && pct >= 100
+    const barW = budget > 0 ? Math.max(2, Math.min(100, pct)) : 0
+    const errColor = C.err
+    /* 2026-10-28：用户要的是「一眼能看见占了多少」的**条子**，不是一行小字。
+       所以改成：上面一行数字，中间一根进度条，超了就变红。 */
     return h(
       'div',
       {
         key: 'inject-preview',
-        style: { marginBottom: 8, fontSize: 11, lineHeight: 1.7, color: C.text2 },
+        style: {
+          marginBottom: 10,
+          padding: '10px 12px',
+          borderRadius: 10,
+          background: C.layer1,
+          border: `1px solid ${C.border1}`,
+        },
       },
-      text,
+      h(
+        'div',
+        {
+          style: {
+            display: 'flex',
+            alignItems: 'baseline',
+            justifyContent: 'space-between',
+            gap: 10,
+            fontSize: 11,
+            color: C.text2,
+            marginBottom: 6,
+          },
+        },
+        h('span', null, `每轮最多带 ${n} 条（${detail}）`),
+        h(
+          'span',
+          { style: { color: over ? errColor : C.text1, fontWeight: 600 } },
+          budget > 0 ? `约 ${est} / ${budget} token · ${pct}%` : '注入上限未设',
+        ),
+      ),
+      h(
+        'div',
+        {
+          style: {
+            height: 7,
+            borderRadius: 4,
+            background: C.layer2 ?? C.bg ?? 'transparent',
+            border: `1px solid ${C.border1}`,
+            overflow: 'hidden',
+          },
+        },
+        barW > 0
+          ? h('div', {
+              style: {
+                width: `${barW}%`,
+                height: '100%',
+                borderRadius: 4,
+                background: over ? errColor : C.brand,
+              },
+            })
+          : null,
+      ),
+      h(
+        'div',
+        { style: { marginTop: 6, fontSize: 11, color: over ? errColor : C.text2, lineHeight: 1.6 } },
+        est > 0
+          ? over
+            ? '超了，多出来的会被预算裁掉 —— 要么调大注入上限，要么把上面的条数减几条'
+            : '按「全库平均每条 token」估算，实际会因条目长短略有出入'
+          : '库里还没有可估价的条目，算不出 token',
+      ),
     )
   }
 
@@ -1013,11 +1069,11 @@ window.__ModuleLoader__.load({
         );
       };
 
+      // 注入占用那条：放在整张卡片最上面（用户要求「在最上面显示」）
+      const preview = injectPreview()
       const groups = SETTING_GROUPS.map((g) => {
         const rows = g.keys.map((k) => byKey[k]).filter(Boolean);
         if (rows.length === 0) return null;
-        // 「每轮载入几条」这组：标题下面先给一行估算，再列三个输入框
-        const preview = g.title === '每轮载入几条' ? injectPreview() : null
         return h(
           'div',
           { key: g.title, style: { marginTop: 12 } },
@@ -1026,7 +1082,6 @@ window.__ModuleLoader__.load({
             { style: { marginBottom: 6, fontSize: 11, letterSpacing: '0.05em', color: C.text2 } },
             g.title,
           ),
-          preview,
           rows.map(row),
         );
       }).filter(Boolean);
@@ -1060,6 +1115,7 @@ window.__ModuleLoader__.load({
           ? h(
               'div',
               { style: { marginTop: 10 } },
+              preview,
               h(
                 'ul',
                 {

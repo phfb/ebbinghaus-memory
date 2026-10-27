@@ -266,6 +266,11 @@ export const TUNABLE_KEYS = Object.freeze([
   'loadLongRandom',
   'loadLongWindowDays',
   'loadPermanentCount',
+  /* 2026-10-28 补：永久区**二级注入**的两个键。之前字段和注入逻辑都写好了
+     （render.mjs 里真的在用），但白名单忘了加 —— `tunableFields()` 按这个白名单过滤，
+     于是设置页那两行输入框**永远不出现**，人只能看着代码干着急。 */
+  'loadPermanentSecondaryCount',
+  'loadPermanentSecondaryDays',
   'budgetTokens',
   'dedupEnabled',
   'dedupEveryEntries',
