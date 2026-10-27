@@ -240,17 +240,29 @@ export function renderInjection(p) {
   });
 
   // ── 挑选（载入策略）──────────────────────────────────────────────
+  // 三个分区都是**确定性**的：同一时刻同一份库，渲染出来必然一样。
+  // 以前长期区是按小时种子随机抽的（`sample()`），换局/重开对话时「想起什么」全看运气 ——
+  // 用户 2026-10-28 明确要求改成「近期权重最高」。
   const shortList = (Array.isArray(zones.short) ? zones.short : [])
     .slice()
     .sort(byTsDesc)
     .slice(0, Math.max(0, loadShort));
 
-  const longList = sample(
-    Array.isArray(zones.long) ? zones.long : [],
-    Math.max(0, loadLong),
-    // 种子按小时变化：同一小时内反复渲染结果稳定，跨小时才换一批
-    (Math.floor(now / 3600000) ^ 0x9e3779b9) >>> 0,
-  ).sort(byTsDesc);
+  // 长期：只在这个时间窗口里挑，按权重从高到低（同权重按时间新的优先）。
+  // 窗口外的一条都不进注入 —— 需要「更久以前但很重要」的记忆时，把它固化到永久区去，
+  // 那条路才是「我记得的」，长期区本来就是过渡层。
+  const loadLongWindowDays = Number.isFinite(Number(cfg.loadLongWindowDays))
+    ? Math.max(1, Number(cfg.loadLongWindowDays))
+    : 60;
+  const longCutoff = now - loadLongWindowDays * 86_400_000;
+  const longPool = (Array.isArray(zones.long) ? zones.long : []).filter(
+    (entry) => (Number(entry?.ts) || 0) >= longCutoff,
+  );
+  const longList = longPool
+    .slice()
+    .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0) || (b.ts ?? 0) - (a.ts ?? 0))
+    .slice(0, Math.max(0, loadLong))
+    .sort(byTsDesc);
 
   const permList = (Array.isArray(zones.permanent) ? zones.permanent : [])
     .slice()

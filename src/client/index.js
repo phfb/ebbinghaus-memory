@@ -844,7 +844,55 @@ window.__ModuleLoader__.load({
       const notice = typeof props.notice === 'string' ? props.notice : '';
       const overridden = Boolean(props.overridden);
 
-      const row = (f) => {
+      /** 读某个设置项「当前会生效的值」（草稿优先于已存值）。 */
+  const valueOfSetting = (key) => {
+    const field = byKey[key]
+    if (!field) return undefined
+    const raw = Object.prototype.hasOwnProperty.call(draft, key) ? draft[key] : field.value
+    const n = Number(raw)
+    return Number.isFinite(n) ? n : undefined
+  }
+
+  /**
+   * 「按现在的设置，每轮大概塞多少 memory 进上下文」。
+   *
+   * 为什么要有：面板上只写了注入预算（budgetTokens）的 token 上限，
+   * 却没告诉人「这几个条数加起来大概占多少」—— 用户 2026-10-28 提的。
+   * 每条的单价用「全库 token ÷ 全库条数」推，所以是**估算**，不是精确值。
+   */
+  const injectPreview = () => {
+    const counts = props.entryCounts && typeof props.entryCounts === 'object' ? props.entryCounts : null
+    if (!counts) return null
+    const avg = Number(props.avgTokensPerEntry)
+    const want = (key, zone) => {
+      const asked = valueOfSetting(key) ?? 0
+      const have = Number(counts[zone]) || 0
+      return Math.max(0, Math.min(asked, have))
+    }
+    const nShort = want('loadShortCount', 'short')
+    const nLong = want('loadLongRandom', 'long')
+    const nPerm = want('loadPermanentCount', 'permanent')
+    const n = nShort + nLong + nPerm
+    const budget = valueOfSetting('budgetTokens') ?? 0
+    const est = avg > 0 ? Math.round(n * avg) : 0
+    const pct = budget > 0 && est > 0 ? Math.round((est / budget) * 100) : 0
+    const detail = `短 ${nShort} / 长 ${nLong} / 永 ${nPerm}`
+    const text =
+      est > 0
+        ? `按现在的设置：每轮最多带 ${n} 条（${detail}），估算约 ${est} token，占注入上限 ${budget > 0 ? `${budget} token 的 ${pct}%` : '（未设）'}` +
+          (pct >= 100 ? ' —— 超了，多出来的会被预算裁掉' : '')
+        : `按现在的设置：每轮最多带 ${n} 条（${detail}）；库里还没有可估价的条目，算不出 token`
+    return h(
+      'div',
+      {
+        key: 'inject-preview',
+        style: { marginBottom: 8, fontSize: 11, lineHeight: 1.7, color: C.text2 },
+      },
+      text,
+    )
+  }
+
+  const row = (f) => {
         const edited = Object.prototype.hasOwnProperty.call(draft, f.key);
 
         // 布尔字段（目前只有「记忆库自检」开关）：渲染成勾选框。
@@ -965,6 +1013,8 @@ window.__ModuleLoader__.load({
       const groups = SETTING_GROUPS.map((g) => {
         const rows = g.keys.map((k) => byKey[k]).filter(Boolean);
         if (rows.length === 0) return null;
+        // 「每轮载入几条」这组：标题下面先给一行估算，再列三个输入框
+        const preview = g.title === '每轮载入几条' ? injectPreview() : null
         return h(
           'div',
           { key: g.title, style: { marginTop: 12 } },
@@ -973,6 +1023,7 @@ window.__ModuleLoader__.load({
             { style: { marginBottom: 6, fontSize: 11, letterSpacing: '0.05em', color: C.text2 } },
             g.title,
           ),
+          preview,
           rows.map(row),
         );
       }).filter(Boolean);
@@ -1542,6 +1593,21 @@ window.__ModuleLoader__.load({
       const head = [`三层记忆 · 共 ${total} 条`, `短期 ${shortDays} 天 / 长期 ${longDays} 天`];
       if (tokenCap > 0) head.push(`总量 ${fmtTokens(tokenTotal)} / ${fmtTokens(tokenCap)} token`);
       if (typeof d.dir === 'string' && d.dir) head.push(d.dir);
+
+  /* 设置卡里那条「预计注入占用」要用的数据：各分区现有条数 + 每条平均 token。
+     平均单价用「全库 token ÷ 全库条数」推，只做量级参考 —— 面板上会写明是估算。 */
+  const zoneCountOf = (key) => {
+    const zone = zones.find((item) => item && item.key === key);
+    return zone ? Math.max(0, num(zone.count, 0)) : 0;
+  };
+  const injectMeta = {
+    entryCounts: {
+      short: zoneCountOf('short'),
+      long: zoneCountOf('long'),
+      permanent: zoneCountOf('permanent'),
+    },
+    avgTokensPerEntry: total > 0 && tokenTotal > 0 ? tokenTotal / total : 0,
+  };
 
       const searchBar = h(
         'div',
@@ -2149,6 +2215,8 @@ window.__ModuleLoader__.load({
             onReclaim: reclaimTotal,
             onMirror: runMirror,
             mirror: isObj(d.mirror) ? d.mirror : null,
+            entryCounts: injectMeta.entryCounts,
+            avgTokensPerEntry: injectMeta.avgTokensPerEntry,
           }),
 
           body,

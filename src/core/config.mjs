@@ -80,7 +80,9 @@ export const CONFIG_SPEC = [
 
   // ── 载入策略 ─────────────────────────────────────────────────────
   { key: 'loadShortCount', type: 'number', default: 12, min: 0, max: 200, step: 1, label: '每轮载入短期几条' },
-  { key: 'loadLongRandom', type: 'number', default: 3, min: 0, max: 50, step: 1, label: '每轮随机忆起长期几条' },
+  // 2026-10-28：长期从「随机忆起」改成「近 N 天内权重最高的」。键名保留是为了不炸老 settings.json。
+  { key: 'loadLongRandom', type: 'number', default: 3, min: 0, max: 50, step: 1, label: '每轮载入长期几条（近 N 天内权重最高的）' },
+  { key: 'loadLongWindowDays', type: 'number', default: 60, min: 1, max: 365, step: 1, label: '长期只在最近几天内挑（默认 60 天）' },
   { key: 'loadPermanentCount', type: 'number', default: 3, min: 0, max: 50, step: 1, label: '每轮载入永久几条' },
   { key: 'budgetTokens', type: 'number', default: 1400, min: 200, max: 8000, step: 1, label: '注入预算（token）· 每轮聊天都会带上这段，调大同时增加聊天输入花费' },
 
@@ -253,6 +255,7 @@ export const TUNABLE_KEYS = Object.freeze([
   'totalTokenCapacity',
   'loadShortCount',
   'loadLongRandom',
+  'loadLongWindowDays',
   'loadPermanentCount',
   'budgetTokens',
   'dedupEnabled',
