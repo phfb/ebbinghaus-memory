@@ -1621,6 +1621,27 @@ window.__ModuleLoader__.load({
       const consolidateBody = h(
         'div',
         null,
+        // bot 记忆专区被锁的时候，把「为什么关不掉」写在最前面 —— 否则用户会反复
+        // 去关那个开关，以为是插件坏了。
+        (() => {
+          const bs = isObj(d.botSpace) ? d.botSpace : null
+          if (!bs || !bs.locked) return null
+          return h(
+            'div',
+            {
+              style: {
+                marginBottom: 8,
+                padding: '6px 8px',
+                borderRadius: 6,
+                background: 'rgba(255,180,0,0.12)',
+                color: C.err,
+                fontSize: 11,
+                lineHeight: 1.6,
+              },
+            },
+            `🔒 ${bs.reason || 'bot 记忆专区已锁定为开启，请先卸载 Qbot 插件后再关闭。'}`,
+          )
+        })(),
         h(
           'p',
           { style: { margin: '0 0 8px', fontSize: 11, color: C.text2, lineHeight: 1.75 } },

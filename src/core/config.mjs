@@ -51,7 +51,7 @@ export const CONFIG_SPEC = [
   // 很多人并不接 QQ bot。所以这一整块默认关着，关着就完全不影响行为（跟 0.8.x 之前一样）。
   // 开了之后：桥接（QQ 之类）来的会话单独绑到一个分区，跟桌面端那些分开存，
   // 互不干扰 —— 桌面端不会读到 QQ 上的碎碎念，QQ 那边也不会翻到桌面的活。
-  { key: 'botSpaceEnabled', type: 'boolean', default: false, label: '启用 bot 记忆专区 · 把 QQ 这类桥接的记忆跟桌面端分开放' },
+  { key: 'botSpaceEnabled', type: 'boolean', default: false, label: '启用 bot 记忆专区 · 把 QQ 这类桥接的记忆跟桌面端分开放（装了 dsh-qq-bot 时强制开启，不允许关闭）' },
   { key: 'botSpaceId', type: 'string', default: '', label: 'bot 专区用哪个分区（填分区 id，面板里能看到；留空 = 不分区）' },
   { key: 'botUins', type: 'string', default: '', label: '只把这些 QQ 号的消息存进专区（逗号分隔；留空 = 桥接来的全算）' },
   // 两次固化之间的最小间隔：防「连着几轮疯狂触发」把并发和额度一起打爆。

@@ -791,17 +791,43 @@ export function apply(ctx, rawConfig) {
 
   /** 会话第一次出现就钉住分区；已经钉过的不动。 */
   /**
+   * 本机有没有装（并加载了）dsh-qq-bot。
+   *
+   * 它自己 `ctx.provide('qqMeme', …)`，所以这是最准的信号 —— 卸载插件之后这个
+   * 服务就没了，比翻日志、翻数据目录都可靠。
+   */
+  function botPluginPresent() {
+    try {
+      const svc = ctx.get('qqMeme');
+      return svc !== null && svc !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * bot 专区**实际生效**的开关。
+   *
+   * 装了 dsh-qq-bot 就强制打开，配置里写 false 也不算数 —— 这一条是专门防
+   * 「神人操作」的：QQ 那套跑着，却把专区关了，两边记忆混在一起，等发现时
+   * 已经分不开了。要关就先卸插件。
+   */
+  function botSpaceEnabledEffective() {
+    return config.botSpaceEnabled === true || botPluginPresent() === true;
+  }
+
+  /**
    * bot 记忆专区：这条消息该不该单独进某个分区。
    *
    * 返回分区 id，或者 `undefined`（表示「跟着当前激活分区」，就是老行为）。
    *
    * 三种情况都退回 undefined，一种都不硬来：
-   *  - 开关没开（绝大多数人根本不接 bot，关着就完全没有影响）
+   *  - 开关没开（且没装 qq-bot）
    *  - 来源不在白名单里，或者不在 `botUins` 指定的号里
    *  - 指定的分区不存在（**不自动建目录** —— 乱建比不建更难收拾）
    */
   function spaceForIncoming(source) {
-    if (!config.botSpaceEnabled) return undefined;
+    if (!botSpaceEnabledEffective()) return undefined;
     const kind = source?.kind;
     if (typeof kind !== 'string' || !userSourceKinds().includes(kind)) return undefined;
 
@@ -1451,6 +1477,9 @@ export function apply(ctx, rawConfig) {
     lines.push(`就绪：${ready} · 降级：${degraded} · 总条数：${store.all().length}`);
     lines.push(`当前路由：${currentRouteLabel()}${fallbackActive ? '（已切兜底）' : ''}`);
     lines.push(`来源白名单：${userSourceKinds().join(',')}`);
+    lines.push(
+      `bot 记忆专区：${botSpaceEnabledEffective() ? '开' : '关'}${botPluginPresent() ? '（检测到 dsh-qq-bot，已锁定为开启，不允许关闭）' : ''} · 分区 ${config.botSpaceId || '未指定'} · 号 ${botUins().join(',') || '全部'}`,
+    );
     lines.push(
       `固化节奏：每 ${config.writeEveryTurns} 轮 · 最小间隔 ${config.minIntervalSeconds}s · maxTokens ${config.maxTokens} · 思考档 ${config.reasoningEffort || '默认'}`,
     );
@@ -2965,6 +2994,22 @@ export function apply(ctx, rawConfig) {
       mirror: mirrorPanelState(),
       // 记忆库自检的进度（面板上「上次自检」那一行）
       dedup: dedupPanelState(),
+      // bot 记忆专区：装了 dsh-qq-bot 时这个开关是**锁死**的，配置写 false 也不算。
+      botSpace: {
+        enabled: botSpaceEnabledEffective(),
+        configured: config.botSpaceEnabled === true,
+        locked: botPluginPresent(),
+        spaceId: typeof config.botSpaceId === 'string' ? config.botSpaceId : '',
+        uins: botUins(),
+        reason: (() => {
+          if (!botPluginPresent()) return '';
+          const sp = typeof config.botSpaceId === 'string' ? config.botSpaceId.trim() : '';
+          if (sp === '') {
+            return '检测到 dsh-qq-bot 正在运行：开关已锁定为开启，但还没填分区 id —— 专区还没生效，填一个分区才会真正分开存。（不允许关闭，除非先卸载 Qbot 插件）';
+          }
+          return '检测到 dsh-qq-bot 正在运行：这个开关被锁定为开启，不允许关闭。请先卸载 Qbot 插件，再回来关它。';
+        })(),
+      },
       // 固化日志（面板上那个小框）。**只给形状**：时间 / 结果 / 条数 / 链路，
       // 不含对话正文、不含记忆内容。最近 30 次，环形。
       consolidate: {

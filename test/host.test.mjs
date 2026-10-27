@@ -2095,3 +2095,54 @@ test('bot 专区：指定的分区不存在时不崩，退回默认分区', asyn
 
   assert.equal(readBindings(dir)['sess-nospace'], 'private', '分区不存在要退回默认，而不是报错');
 });
+
+/* ── 2026-10-27：装了 qq-bot 时，bot 专区开关锁死（防「神人操作」） ── */
+
+test('装了 dsh-qq-bot 时：开关写 false 也强制开，QQ 会话照样进专区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir);
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, 'QQ 一句')]) });
+  const h = makeCtx(llm);
+  // dsh-qq-bot 会在 apply 里 provide('qqMeme', …) —— 这里模拟它已经装了
+  h.services.set('qqMeme', { send() {}, canSend() { return true; } });
+
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: false, // 用户想关掉
+    botSpaceId: 'work',
+  });
+
+  const agent = makeAgent('sess-lock', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-lock', '在吗', { kind: 'qq', uin: '3448932873' });
+
+  assert.equal(readBindings(dir)['sess-lock'], 'work', '装了 QQ bot 就不允许关专区');
+
+  const snap = await h.services.get('ebbinghausMemory').state();
+  assert.equal(snap.botSpace.locked, true);
+  assert.equal(snap.botSpace.enabled, true);
+  assert.match(snap.botSpace.reason, /卸载/);
+});
+
+test('没装 dsh-qq-bot：开关照配置走，关着就不分区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir);
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1, botSpaceEnabled: false, botSpaceId: 'work' });
+
+  const agent = makeAgent('sess-nolock', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-nolock', '在吗', { kind: 'qq', uin: '1' });
+
+  assert.equal(readBindings(dir)['sess-nolock'], 'private', '没装 bot 插件就按配置来');
+
+  const snap = await h.services.get('ebbinghausMemory').state();
+  assert.equal(snap.botSpace.locked, false);
+  assert.equal(snap.botSpace.enabled, false);
+});
