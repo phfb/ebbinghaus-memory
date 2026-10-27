@@ -501,6 +501,7 @@ test('HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
 
   const paths = h.routes.map((r) => r.path).sort();
   assert.deepEqual(paths, [
+    '/ebbinghaus/bot-space',
     '/ebbinghaus/compress',
     '/ebbinghaus/dedup',
     '/ebbinghaus/diagnostics',
@@ -509,6 +510,7 @@ test('HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
     '/ebbinghaus/harvest',
     '/ebbinghaus/mirror',
     '/ebbinghaus/reclaim',
+    '/ebbinghaus/recover',
     '/ebbinghaus/reload',
     '/ebbinghaus/settings',
     '/ebbinghaus/spaces/active',
@@ -2122,9 +2124,8 @@ test('装了 dsh-qq-bot 时：开关写 false 也强制开，QQ 会话照样进�
   assert.equal(readBindings(dir)['sess-lock'], 'work', '装了 QQ bot 就不允许关专区');
 
   const snap = await h.services.get('ebbinghausMemory').state();
-  assert.equal(snap.botSpace.locked, true);
-  assert.equal(snap.botSpace.enabled, true);
-  assert.match(snap.botSpace.reason, /卸载/);
+  assert.equal(snap.botSpace.pluginPresent, true, '检测到 qq-bot');
+  assert.equal(snap.botSpace.enabled, true, '锁死为开启');
 });
 
 test('没装 dsh-qq-bot：开关照配置走，关着就不分区', async (t) => {
@@ -2143,6 +2144,6 @@ test('没装 dsh-qq-bot：开关照配置走，关着就不分区', async (t) =>
   assert.equal(readBindings(dir)['sess-nolock'], 'private', '没装 bot 插件就按配置来');
 
   const snap = await h.services.get('ebbinghausMemory').state();
-  assert.equal(snap.botSpace.locked, false);
+  assert.equal(snap.botSpace.pluginPresent, false);
   assert.equal(snap.botSpace.enabled, false);
 });

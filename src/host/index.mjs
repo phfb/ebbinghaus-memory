@@ -79,6 +79,7 @@ import {
 } from '../core/spaces.mjs';
 import { ZONE_LABEL, ZONES, normalizeEntry, normalizeWeight } from '../core/schema.mjs';
 import { canonicalizeEntry, extractJsonArray } from '../core/compat.mjs';
+import { groupByZone, parseJsonl, pickMissing, scanJsonl } from '../core/recover.mjs';
 import { expiryOverview, fullStamp, relativeStamp, stampFor } from '../core/time.mjs';
 import { harvest, initialZoneFor, isOverCapacity, digestDropped } from '../core/zones.mjs';
 import { compressWithModel, fallbackMerge, pickCompressGroup } from '../core/compress.mjs';
@@ -790,6 +791,73 @@ export function apply(ctx, rawConfig) {
   }
 
   /** 会话第一次出现就钉住分区；已经钉过的不动。 */
+  /* ── bot 记忆专区：独立持久化 ────────────────────────────────────
+     为什么不放 config / settings.json：这两个都会被「切分区」「面板覆盖设置」
+     影响，而这个绑定必须是**钉死的** —— 用户在面板上选了哪个分区，此后不管上方
+     「当前记忆分区」切到哪儿、面板设置怎么改，bot 的会话都只进那一个。
+     所以单独一个文件：<库根>/bot-space.json */
+  const BOT_SPACE_FILE = 'bot-space.json';
+  /** @type {{spaceId: string, lockedAt: number, seenUins: Record<string, number>}} */
+  let botSpace = { spaceId: '', lockedAt: 0, seenUins: {} };
+
+  function botSpacePath() {
+    return path.join(libraryRoot, BOT_SPACE_FILE);
+  }
+
+  function loadBotSpace() {
+    try {
+      const raw = JSON.parse(readFileSync(botSpacePath(), 'utf8'));
+      botSpace = {
+        spaceId: typeof raw?.spaceId === 'string' ? raw.spaceId : '',
+        lockedAt: Number(raw?.lockedAt) || 0,
+        seenUins:
+          raw !== null && typeof raw?.seenUins === 'object' && raw.seenUins !== null
+            ? { ...raw.seenUins }
+            : {},
+      };
+    } catch {
+      // 第一次跑没有这个文件，保持默认
+    }
+  }
+
+  function saveBotSpace() {
+    try {
+      writeFileSync(botSpacePath(), `${JSON.stringify({ version: 1, ...botSpace }, null, 2)}\n`, 'utf8');
+      return true;
+    } catch (err) {
+      warn(`bot 专区设置落盘失败：${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  loadBotSpace();
+
+  /** bot 专区实际用哪个分区：面板钉死的优先，其次配置里的。都没有 = 不分区。 */
+  function botSpaceId() {
+    const fromFile = typeof botSpace.spaceId === 'string' ? botSpace.spaceId.trim() : '';
+    if (fromFile !== '') return fromFile;
+    return typeof config.botSpaceId === 'string' ? config.botSpaceId.trim() : '';
+  }
+
+  /** 面板要的 bot 专区状态。 */
+  function botSpacePanel() {
+    const list = (spaceInfo.spaces ?? []).map((s) => ({ id: s.id, name: s.name }));
+    const seenUins = Object.entries(botSpace.seenUins ?? {})
+      .map(([uin, at]) => ({ uin, at: Number(at) || 0 }))
+      .filter((x) => x.uin !== '')
+      .sort((a, b) => b.at - a.at);
+    const locked = botSpace.lockedAt > 0 && botSpace.spaceId.trim() !== '';
+    return {
+      spaceId: botSpaceId(),
+      locked,
+      lockedAt: botSpace.lockedAt,
+      seenUins,
+      spaces: list,
+      pluginPresent: botPluginPresent(),
+      enabled: botSpaceEnabledEffective(),
+    };
+  }
+
   /**
    * 本机有没有装（并加载了）dsh-qq-bot。
    *
@@ -837,7 +905,7 @@ export function apply(ctx, rawConfig) {
       if (uin === '' || !uins.includes(uin)) return undefined;
     }
 
-    const target = typeof config.botSpaceId === 'string' ? config.botSpaceId.trim() : '';
+    const target = botSpaceId();
     if (target === '') return undefined;
     const exists = (spaceInfo.spaces ?? []).some((sp) => sp.id === target);
     if (!exists) {
@@ -1363,6 +1431,17 @@ export function apply(ctx, rawConfig) {
 
         s.turn += 1;
         s.lastUserText = text;
+        // 记一笔「谁在跟我聊」：面板上那行「记录对话的 QQ 号」读的就是这里。
+        // 每分钟最多落盘一次 —— 别为了一个显示用的时间戳每条消息都写文件。
+        const uin = String(event.data?.source?.uin ?? '').trim();
+        if (uin !== '') {
+          const nowMs = Date.now();
+          const prev = Number(botSpace.seenUins[uin]);
+          if (!Number.isFinite(prev) || nowMs - prev > 60000) {
+            botSpace.seenUins[uin] = nowMs;
+            saveBotSpace();
+          }
+        }
         // 新一轮：作废注入缓存
         s.renderCache = { turn: -1, text: '' };
         s.transcript.push({ role: 'user', text: text.slice(0, MAX_MESSAGE_CHARS) });
@@ -1448,6 +1527,99 @@ export function apply(ctx, rawConfig) {
       return `${p}/${m}`;
     } catch {
       return '?';
+    }
+  }
+
+  /** 某个分区在镜像里的备份目录（`<mirrorDir>/<spaceId>/library`）。 */
+  function mirrorPartitionDir(spaceId) {
+    const dir = typeof config.mirrorDir === 'string' ? config.mirrorDir.trim() : '';
+    if (dir === '') return '';
+    return path.join(dir, spaceId, 'library');
+  }
+
+  /**
+   * 分区体检：目录在不在、每个 jsonl 有多少行读不出来。
+   *
+   * 只在面板刷新时算 —— 开销是「把每个分区读一遍」，不能放进每条消息的路径。
+   */
+  function partitionHealth() {
+    const out = [];
+    for (const sp of spaceInfo.spaces ?? []) {
+      const dir = spaceDirOf(libraryRoot, sp.id);
+      const problems = [];
+      if (!existsSync(dir)) {
+        problems.push('分区目录不存在');
+      } else {
+        for (const zone of ZONES) {
+          const p = path.join(dir, `${zone}.jsonl`);
+          if (!existsSync(p)) continue;
+          try {
+            const { total, bad } = scanJsonl(readFileSync(p, 'utf8'));
+            if (bad > 0) problems.push(`${zone}.jsonl 有 ${bad}/${total} 行读不出来`);
+          } catch {
+            problems.push(`${zone}.jsonl 读不出来`);
+          }
+        }
+      }
+      if (problems.length > 0) {
+        out.push({ id: sp.id, name: sp.name, problems, hasMirror: existsSync(mirrorPartitionDir(sp.id)) });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 从镜像把某个分区**缺失的**条目补回来。
+   *
+   * 镜像那份可能比本地旧 —— 整份盖回去等于把后来记的全删了。所以按 id 做差集，
+   * 本地已有的一个字节都不动，读不出来的行只计数不修。
+   */
+  async function recoverFromMirror(spaceId) {
+    const src = mirrorPartitionDir(spaceId);
+    if (src === '') return { ok: false, reason: '没配镜像目录（mirrorDir 是空的）' };
+    if (!existsSync(src)) return { ok: false, reason: `镜像里没有分区「${spaceId}」的备份` };
+    const targetDir = spaceDirOf(libraryRoot, spaceId);
+    try {
+      mkdirSync(targetDir, { recursive: true });
+      const localIds = new Set();
+      for (const zone of ZONES) {
+        const p = path.join(targetDir, `${zone}.jsonl`);
+        if (!existsSync(p)) continue;
+        const { entries } = parseJsonl(readFileSync(p, 'utf8'));
+        for (const e of entries) if (typeof e?.id === 'string') localIds.add(e.id);
+      }
+      let added = 0;
+      let badLines = 0;
+      let skipped = 0;
+      for (const zone of ZONES) {
+        const p = path.join(src, `${zone}.jsonl`);
+        if (!existsSync(p)) continue;
+        const parsed = parseJsonl(readFileSync(p, 'utf8'));
+        badLines += parsed.badLines;
+        const { add, skipped: sk } = pickMissing(localIds, parsed.entries);
+        skipped += sk;
+        if (add.length === 0) continue;
+        const grouped = groupByZone(add, ZONES);
+        for (const z of ZONES) {
+          const list = grouped[z] ?? [];
+          if (list.length === 0) continue;
+          const target = path.join(targetDir, `${z}.jsonl`);
+          appendFileSync(target, list.map((e) => `${JSON.stringify(e)}\n`).join(''), 'utf8');
+          for (const e of list) localIds.add(e.id);
+          added += list.length;
+        }
+      }
+      if (added > 0) {
+        try {
+          await reloadNow();
+        } catch {
+          // 重载失败不影响已经补进去的（下次启动会读回来）
+        }
+      }
+      log(`从镜像恢复分区「${spaceId}」：补 ${added} 条（跳过 ${skipped}，坏行 ${badLines}）`);
+      return { ok: true, added, skipped, badLines };
+    } catch (err) {
+      return { ok: false, reason: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -3010,6 +3182,10 @@ export function apply(ctx, rawConfig) {
           return '检测到 dsh-qq-bot 正在运行：这个开关被锁定为开启，不允许关闭。请先卸载 Qbot 插件，再回来关它。';
         })(),
       },
+      // bot 记忆专区：独立文件里钉死的绑定（不受当前分区 / 面板覆盖设置影响）
+      botSpace: botSpacePanel(),
+      // 分区体检：谁炸了、镜像里有没有备份
+      health: partitionHealth(),
       // 固化日志（面板上那个小框）。**只给形状**：时间 / 结果 / 条数 / 链路，
       // 不含对话正文、不含记忆内容。最近 30 次，环形。
       consolidate: {
@@ -3207,6 +3383,67 @@ export function apply(ctx, rawConfig) {
               if (req.method !== 'GET') return reply(res, 405, { ok: false, error: '只支持 GET' });
               await loadPromise;
               return reply(res, 200, { ok: true, text: buildDiagnostics() });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          // bot 记忆专区的绑定：读 / 钉死。**钉死之后不允许改** —— 改分区等于把
+          // 两边的记忆重新搅在一起，那正是这个功能要防的事。
+          kind: 'exact',
+          path: `${PANEL_BASE}/bot-space`,
+          handler: async (req, res) => {
+            try {
+              if (req.method === 'GET') {
+                await loadPromise;
+                return reply(res, 200, { ok: true, ...botSpacePanel() });
+              }
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 GET / POST' });
+              let body;
+              try {
+                body = await readBody(req);
+              } catch (err) {
+                return fail(res, 413, err);
+              }
+              const spaceId = typeof body?.spaceId === 'string' ? body.spaceId.trim() : '';
+              if (spaceId === '') return reply(res, 400, { ok: false, error: '缺 spaceId' });
+              if (!(spaceInfo.spaces ?? []).some((s) => s.id === spaceId)) {
+                return reply(res, 400, { ok: false, error: `没有这个分区：${spaceId}` });
+              }
+              const lockedId = typeof botSpace.spaceId === 'string' ? botSpace.spaceId.trim() : '';
+              if (botSpace.lockedAt > 0 && lockedId !== '' && lockedId !== spaceId) {
+                return reply(res, 409, {
+                  ok: false,
+                  error: `已经钉死在「${lockedId}」，不允许更改。真要换，得手动删掉 bot-space.json。`,
+                });
+              }
+              botSpace.spaceId = spaceId;
+              if (!(botSpace.lockedAt > 0)) botSpace.lockedAt = Date.now();
+              if (!saveBotSpace()) return reply(res, 500, { ok: false, error: '写不进去' });
+              return reply(res, 200, { ok: true, ...botSpacePanel() });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          // 从镜像补一个分区缺失的条目（只补缺失，不覆盖）
+          kind: 'exact',
+          path: `${PANEL_BASE}/recover`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              let body;
+              try {
+                body = await readBody(req);
+              } catch (err) {
+                return fail(res, 413, err);
+              }
+              const spaceId = typeof body?.spaceId === 'string' ? body.spaceId.trim() : '';
+              if (spaceId === '') return reply(res, 400, { ok: false, error: '缺 spaceId' });
+              const result = await recoverFromMirror(spaceId);
+              return reply(res, result.ok ? 200 : 400, result);
             } catch (err) {
               return fail(res, 500, err);
             }

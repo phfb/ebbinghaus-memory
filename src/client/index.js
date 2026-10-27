@@ -1298,6 +1298,43 @@ window.__ModuleLoader__.load({
        * 「立刻自检」—— 手动跑一次重复合并。
        * 纯本地算法，毫秒级，所以能等它跑完再刷新（用户点了按钮就该看到结果）。
        */
+      /** bot 专区的提示 + 分区体检的提示 */
+      const [botNotice, setBotNotice] = useState('');
+      const [botPick, setBotPick] = useState('');
+
+      /** 把 bot 专区钉死在某个分区（钉死后不可改）。 */
+      function saveBotSpace() {
+        const spaceId = botPick || (isObj(d.botSpace) ? String(d.botSpace.spaceId || '') : '');
+        if (!spaceId) {
+          setBotNotice('先选一个分区');
+          return;
+        }
+        postJson('/bot-space', { spaceId })
+          .then((r) => {
+            if (r && r.ok === false) {
+              setBotNotice(String(r.error || '保存失败'));
+              return;
+            }
+            setBotNotice(`已钉死在「${spaceId}」，之后不允许更改`);
+            reload();
+          })
+          .catch(() => setBotNotice('保存失败'));
+      }
+
+      /** 从镜像把某个分区缺失的条目补回来。 */
+      function recoverPartition(spaceId) {
+        postJson('/recover', { spaceId })
+          .then((r) => {
+            if (r && r.ok === false) {
+              setBotNotice(String(r.reason || '恢复失败'));
+              return;
+            }
+            setBotNotice(`已从镜像补回 ${num(r.added, 0)} 条（跳过 ${num(r.skipped, 0)}，坏行 ${num(r.badLines, 0)}）`);
+            reload();
+          })
+          .catch(() => setBotNotice('恢复失败'));
+      }
+
       /** 生成诊断文本并尽量塞进剪贴板（不给权限就摊在框里让人手抄）。 */
       function copyDiagnostics() {
         setDiagNotice('正在生成…');
@@ -1725,6 +1762,92 @@ window.__ModuleLoader__.load({
           : null,
       );
 
+      /* bot 记忆专区：QQ 号（自动收集）+ 分区（钉死不可改） */
+      const botInfo = isObj(d.botSpace) ? d.botSpace : {};
+      const botSeen = Array.isArray(botInfo.seenUins) ? botInfo.seenUins : [];
+      const botSpaces = Array.isArray(botInfo.spaces) ? botInfo.spaces : [];
+      const botLocked = Boolean(botInfo.locked);
+      const botBody = h(
+        'div',
+        null,
+        h(
+          'p',
+          { style: { margin: '0 0 8px', fontSize: 12, color: C.text2, lineHeight: 1.75 } },
+          botInfo.pluginPresent
+            ? '检测到 dsh-qq-bot：这一区锁定为开启（不允许关闭，除非先卸载 Qbot 插件）'
+            : '没检测到 dsh-qq-bot —— 这一区不影响任何东西',
+        ),
+        h(
+          'div',
+          { style: { fontSize: 11, color: C.text2, lineHeight: 1.8 } },
+          botSeen.length === 0
+            ? '记录对话的 QQ 号：还没有人发过消息'
+            : `记录对话的 QQ 号：${botSeen.map((x) => `${x.uin}（${hhmm(x.at)}）`).join('、')}`,
+        ),
+        h(
+          'div',
+          { style: { marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
+          botLocked
+            ? h(
+                'span',
+                { style: { fontSize: 11, color: C.text2 } },
+                `已钉死：${botInfo.spaceId || '?'} —— 不允许更改（要换得手动删掉库根的 bot-space.json）`,
+              )
+            : [
+                h(
+                  'select',
+                  {
+                    key: 'botpick',
+                    value: botPick || botInfo.spaceId || '',
+                    onChange: (e) => setBotPick(e && e.target ? String(e.target.value) : ''),
+                    style: { ...settingInputStyle(), minWidth: 160 },
+                  },
+                  h('option', { key: 'none', value: '' }, '— 选一个分区 —'),
+                  ...botSpaces.map((s) => h('option', { key: s.id, value: s.id }, `${s.name}（${s.id}）`)),
+                ),
+                h(
+                  'button',
+                  {
+                    key: 'botsave',
+                    type: 'button',
+                    onClick: saveBotSpace,
+                    style: chipStyle(C.brand, false),
+                    title: '选定之后不能更改，确认好再点',
+                  },
+                  '钉死到这个分区',
+                ),
+              ],
+        ),
+        botNotice ? h('div', { style: { marginTop: 6, fontSize: 11, color: C.text2 } }, botNotice) : null,
+      );
+
+      /* 分区体检：只列有问题的那些 */
+      const healthList = Array.isArray(d.health) ? d.health : [];
+      const healthBody = h(
+        'div',
+        null,
+        healthList.length === 0
+          ? h(Empty, { text: '分区都读得出来，没问题。' })
+          : healthList.map((row) =>
+              h(
+                'div',
+                { key: `hl-${row.id}`, style: { fontSize: 11, color: C.err, lineHeight: 1.9 } },
+                `⛔ ${row.name || row.id}（${row.id}）：${(row.problems || []).join('；')}`,
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    onClick: () => recoverPartition(row.id),
+                    disabled: !row.hasMirror,
+                    title: row.hasMirror ? '从镜像只补缺失的条目，不覆盖已有' : '镜像里没有这个分区的备份',
+                    style: { ...chipStyle(C.text2, !row.hasMirror), marginLeft: 8 },
+                  },
+                  row.hasMirror ? '从镜像恢复' : '镜像里没有备份',
+                ),
+              ),
+            ),
+      );
+
       const dedupBody = h(
         'div',
         null,
@@ -2002,6 +2125,10 @@ window.__ModuleLoader__.load({
                 }, '取消'),
               )
             : null,
+
+          h(Section, { title: 'bot 记忆专区' }, botBody),
+
+          h(Section, { title: '分区体检' }, healthBody),
 
           h(Section, { title: '固化日志' }, consolidateBody),
 
