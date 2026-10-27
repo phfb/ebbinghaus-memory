@@ -83,7 +83,7 @@ export const CONFIG_SPEC = [
   // 2026-10-28：长期从「随机忆起」改成「近 N 天内权重最高的」。键名保留是为了不炸老 settings.json。
   { key: 'loadLongRandom', type: 'number', default: 3, min: 0, max: 50, step: 1, label: '每轮载入长期几条（近 N 天内权重最高的）' },
   { key: 'loadLongWindowDays', type: 'number', default: 60, min: 1, max: 365, step: 1, label: '长期只在最近几天内挑（默认 60 天）' },
-  { key: 'loadPermanentCount', type: 'number', default: 3, min: 0, max: 50, step: 1, label: '每轮载入永久几条' },
+  { key: 'loadPermanentCount', type: 'number', default: 6, min: 0, max: 50, step: 1, label: '每轮载入永久几条' },
   { key: 'budgetTokens', type: 'number', default: 1400, min: 200, max: 8000, step: 1, label: '注入预算（token）· 每轮聊天都会带上这段，调大同时增加聊天输入花费' },
 
   // ── 升级 / 淘汰门槛 ──────────────────────────────────────────────
@@ -135,7 +135,10 @@ export const CONFIG_SPEC = [
   { key: 'provider', type: 'string', default: '', label: '固化用 provider（留空 = 跟随聊天模型）' },
   { key: 'model', type: 'string', default: '', label: '固化用模型（留空 = 跟随聊天模型）' },
   { key: 'reasoningEffort', type: 'string', default: 'off', label: '固化的思考档位（保持 off）' },
-  { key: 'maxTokens', type: 'number', default: 1200, min: 200, max: 8000, step: 1, label: '固化最大输出 token · 调大只影响固化的花费，不吃聊天上下文' },
+  // 2026-10-28：默认 1200 → 4000。会思考的模型（哪怕开了 off 档）一次固化实测要吃
+  // 1200~2000 的输出预算，1200 会被思考吃光、content 回来是空串，插件按「解析失败」整批丢弃，
+  // 症状就是「memory_stats 一直说模型输出不是合法 JSON，一条也记不进去」。
+  { key: 'maxTokens', type: 'number', default: 4000, min: 200, max: 8000, step: 1, label: '固化最大输出 token · 调大只影响固化的花费，不吃聊天上下文' },
   { key: 'jobTimeoutMs', type: 'number', default: 60000, min: 5000, max: 600000, step: 1000, label: '后台任务超时（毫秒）' },
 
   // ── 固化链路兜底（2026-10-27 加）─────────────────────────────────
