@@ -2500,31 +2500,25 @@ export function apply(ctx, rawConfig) {
    */
   async function runMirrorNow(trigger) {
     const dir = String(config.mirrorDir ?? '').trim();
-    const safe = isSafeMirrorDir(path.join(path.resolve(dir), spaceInfo.activeId), dataDir);
+    const root = path.resolve(dir);
+    // 安全校验拿「当前激活分区」当锚点，保证不会往记忆库自己身上盖
+    const safe = isSafeMirrorDir(path.join(root, activeSpaceId), dataDir);
     if (!safe.ok) {
       mirrorState = { ...mirrorState, lastOk: false, lastError: safe.reason };
       writeMirrorState(dataDir, mirrorState);
       return { ok: false, reason: safe.reason };
     }
 
-    // 每个分区一个子目录：镜像里也是「多开」，互不覆盖
-    const mir = path.join(path.resolve(dir), spaceInfo.activeId);
-    try {
-      mkdirSync(mir, { recursive: true });
-      for (const sub of ['library', 'dsh', 'extra']) {
-        try {
-          rmSync(path.join(mir, sub), { recursive: true, force: true });
-        } catch {
-          // 删不掉就覆盖，别因此整个同步失败
-        }
-      }
+    const spaces = spaceInfo.spaces ?? [];
+    if (spaces.length === 0) return { ok: false, reason: '还没有任何分区' };
 
-      const plan = planMirror({ dataDir, dshHome: dshHome(), extraPaths: config.mirrorExtraPaths });
+    /** 把 plan 里的条目复制进 targetDir。 */
+    const copyPlan = (plan, targetDir) => {
       const files = [];
       let bytes = 0;
       for (const item of plan.items) {
         if (!existsSync(item.src)) continue;
-        const dest = path.join(mir, item.rel.split('/').join(path.sep));
+        const dest = path.join(targetDir, item.rel.split('/').join(path.sep));
         mkdirSync(path.dirname(dest), { recursive: true });
         cpSync(item.src, dest, { recursive: true, force: true, filter: (s) => !shouldSkipName(path.basename(s)) });
         let size = 0;
@@ -2536,24 +2530,73 @@ export function apply(ctx, rawConfig) {
         bytes += size;
         files.push({ rel: item.rel, src: item.src, kind: item.kind, size, mtime: Date.now() });
       }
+      return { files, bytes };
+    };
 
-      const manifest = buildManifest({
-        createdAt: Date.now(),
-        dataDir,
-        dshHome: dshHome(),
-        counts: {
-          short: store.zones.short.length,
-          long: store.zones.long.length,
-          permanent: store.zones.permanent.length,
-        },
-        pluginVersion: pluginVersionOf(),
-        files,
-      });
-      writeFileSync(path.join(mir, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    let totalFiles = 0;
+    let totalBytes = 0;
+    const warnings = [];
 
-      // 入口 .cmd 全英文，直接写；.ps1 里有大段中文，powershell 5.1 必须靠 BOM 才不会乱码
-      writeFileSync(path.join(mir, RESTORE_CMD), renderRestoreCmd(), 'utf8');
-      writeFileSync(path.join(mir, RESTORE_PS1), `\uFEFF${renderRestorePs1()}`, 'utf8');
+    try {
+      /* ① 每个分区的记忆各写一份 —— **不再只看当前激活的那个**。
+             2026-10-27 的 bug：以前目录名取 `spaceInfo.activeId`（启动时的快照），
+             内容却取活的 `dataDir`；切过分区就会「名字是 A、内容是 B」，
+             拿它恢复等于把 B 的记忆灌进 A。现在逐个分区来，谁也不会串。 */
+      for (const sp of spaces) {
+        const srcDir = spaceDirOf(libraryRoot, sp.id);
+        if (!existsSync(srcDir)) continue;
+        const mir = path.join(root, sp.id);
+        mkdirSync(mir, { recursive: true });
+        try {
+          rmSync(path.join(mir, 'library'), { recursive: true, force: true });
+        } catch {
+          // 删不掉就覆盖，别因此整个同步失败
+        }
+        // dshHome / extraPaths 传空：那两样只在下面按「激活分区」写一次，
+        // 否则 N 个分区就复制 N 份图片，白占空间
+        const plan = planMirror({ dataDir: srcDir, dshHome: '', extraPaths: [] });
+        const got = copyPlan(plan, mir);
+        totalFiles += got.files.length;
+        totalBytes += got.bytes;
+
+        const countOf = (zone) => {
+          try {
+            const p = path.join(srcDir, `${zone}.jsonl`);
+            if (!existsSync(p)) return 0;
+            return readFileSync(p, 'utf8').split('\n').filter((x) => x.trim() !== '').length;
+          } catch {
+            return 0;
+          }
+        };
+        const manifest = buildManifest({
+          createdAt: Date.now(),
+          dataDir: srcDir,
+          dshHome: '',
+          counts: { short: countOf('short'), long: countOf('long'), permanent: countOf('permanent') },
+          pluginVersion: pluginVersionOf(),
+          files: got.files,
+        });
+        writeFileSync(path.join(mir, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+        writeFileSync(path.join(mir, RESTORE_CMD), renderRestoreCmd(), 'utf8');
+        // .ps1 里有大段中文，powershell 5.1 必须靠 BOM 才不会乱码
+        writeFileSync(path.join(mir, RESTORE_PS1), `\uFEFF${renderRestorePs1()}`, 'utf8');
+      }
+
+      /* ② dsh（人格提示词）+ extra（额外路径）只写进当前激活分区 —— 大文件不复制 N 份 */
+      const activeMir = path.join(root, activeSpaceId);
+      mkdirSync(activeMir, { recursive: true });
+      for (const sub of ['dsh', 'extra']) {
+        try {
+          rmSync(path.join(activeMir, sub), { recursive: true, force: true });
+        } catch {
+          // 同上
+        }
+      }
+      const shared = planMirror({ dataDir, dshHome: dshHome(), extraPaths: config.mirrorExtraPaths });
+      const gotShared = copyPlan({ items: shared.items.filter((x) => x.kind !== 'library') }, activeMir);
+      totalFiles += gotShared.files.length;
+      totalBytes += gotShared.bytes;
+      warnings.push(...shared.warnings);
 
       mirrorState = {
         ...mirrorState,
@@ -2561,13 +2604,13 @@ export function apply(ctx, rawConfig) {
         lastAt: new Date().toISOString(),
         lastOk: true,
         lastError: null,
-        lastFiles: files.length,
-        lastBytes: bytes,
+        lastFiles: totalFiles,
+        lastBytes: totalBytes,
         lastTrigger: trigger,
       };
       writeMirrorState(dataDir, mirrorState);
-      for (const w of plan.warnings) warn(`镜像：${w}`);
-      return { ok: true, files: files.length, bytes, dir: mir };
+      for (const w of warnings) warn(`镜像：${w}`);
+      return { ok: true, files: totalFiles, bytes: totalBytes, dir: root, spaces: spaces.map((s) => s.id) };
     } catch (err) {
       mirrorState = { ...mirrorState, lastOk: false, lastError: err instanceof Error ? err.message : String(err) };
       writeMirrorState(dataDir, mirrorState);
@@ -3236,7 +3279,7 @@ export function apply(ctx, rawConfig) {
       },
       dir: dataDir,
       spaces: {
-        active: spaceInfo.activeId,
+        active: activeSpaceId,
         name: spaceInfo.activeName,
         list: spaceInfo.spaces,
         migrated: spaceInfo.migrated,

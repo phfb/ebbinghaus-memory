@@ -2147,3 +2147,53 @@ test('没装 dsh-qq-bot：开关照配置走，关着就不分区', async (t) =>
   assert.equal(snap.botSpace.pluginPresent, false);
   assert.equal(snap.botSpace.enabled, false);
 });
+
+/* ── 2026-10-27：镜像必须覆盖所有分区（以前只写"启动时那个"，切了分区会写错目录） ── */
+
+test('镜像同步：每个分区各写一份，不是只写当前激活那个', async (t) => {
+  const dir = await tempDir();
+  const mirrorDir = await tempDir();
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+    await rm(mirrorDir, { recursive: true, force: true });
+  });
+  makeTwoSpaces(dir); // private(active) + work
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '一条记忆')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1, mirrorEnabled: true, mirrorDir });
+
+  const agent = makeAgent('sess-mir', h.sections);
+  h.emit('agent/created', { agent });
+  h.emit('session/event', { id: 'sess-mir' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '记一下' }] },
+  });
+  h.emit('agent/turn-stopping', { agent });
+  await h.services.get('ebbinghausMemory').flush();
+
+  // 手动点一次「同步镜像」
+  const route = h.route('/ebbinghaus/mirror');
+  assert.ok(route, '要有 /mirror 路由');
+  /** @type {any} */
+  const res = {
+    statusCode: 0,
+    setHeader() {},
+    end(body) {
+      this.body = body;
+    },
+  };
+  await route.handler({ method: 'POST' }, res);
+
+  assert.ok(existsSync(path.join(mirrorDir, 'private')), 'private 要有镜像目录');
+  assert.ok(existsSync(path.join(mirrorDir, 'work')), 'work 也要有 —— 不能只镜像当前激活分区');
+  assert.ok(
+    existsSync(path.join(mirrorDir, 'private', 'library', 'short.jsonl')),
+    'private 的 short.jsonl 要落到自己的目录里',
+  );
+  assert.ok(
+    existsSync(path.join(mirrorDir, 'work', 'library')),
+    'work 的 library 要落到自己的目录里',
+  );
+});
