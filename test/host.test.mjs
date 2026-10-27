@@ -1653,7 +1653,7 @@ test('QQ 转进来的消息也能触发固化（source.kind = qq）', async (t) 
   // dsh-qq-bot 造的消息：source.kind 是 'qq'，不是 'user'（见它的 SOURCE_KIND）
   h.emit('session/event', { id: 'sess-qq' }, {
     type: 'user/message',
-    data: { source: { kind: 'qq', uin: '1000100001' }, content: [{ type: 'text', text: '在吗' }] },
+    data: { source: { kind: 'qq', uin: '123456789' }, content: [{ type: 'text', text: '在吗' }] },
   });
   h.emit('agent/turn-stopping', { agent });
   await h.services.get('ebbinghausMemory').flush();
@@ -2043,12 +2043,12 @@ test('bot 专区：开关开着 + 号对得上 → 会话绑到指定分区', as
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '1000100001',
+    botUins: '123456789',
   });
 
   const agent = makeAgent('sess-bot', h.sections);
   h.emit('agent/created', { agent });
-  await sayWithSource(h, agent, 'sess-bot', '在吗', { kind: 'qq', uin: '1000100001' });
+  await sayWithSource(h, agent, 'sess-bot', '在吗', { kind: 'qq', uin: '123456789' });
 
   assert.equal(readBindings(dir)['sess-bot'], 'work', 'QQ 会话要绑到 bot 专区');
 });
@@ -2065,7 +2065,7 @@ test('bot 专区：号不在名单里 / 开关关着 → 还是跟着默认分�
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '1000100001',
+    botUins: '123456789',
   });
 
   const agent = makeAgent('sess-other', h.sections);
@@ -2119,7 +2119,7 @@ test('装了 dsh-qq-bot 时：开关写 false 也强制开，QQ 会话照样进�
 
   const agent = makeAgent('sess-lock', h.sections);
   h.emit('agent/created', { agent });
-  await sayWithSource(h, agent, 'sess-lock', '在吗', { kind: 'qq', uin: '1000100001' });
+  await sayWithSource(h, agent, 'sess-lock', '在吗', { kind: 'qq', uin: '123456789' });
 
   assert.equal(readBindings(dir)['sess-lock'], 'work', '装了 QQ bot 就不允许关专区');
 

@@ -79,12 +79,18 @@ export const CONFIG_SPEC = [
   { key: 'permanentDetail', type: 'number', default: 0.3, min: 0.1, max: 1, step: 0.05, label: '永久记忆强度（详细度）' },
 
   // ── 载入策略 ─────────────────────────────────────────────────────
-  { key: 'loadShortCount', type: 'number', default: 12, min: 0, max: 200, step: 1, label: '每轮载入短期几条' },
+  { key: 'loadShortCount', type: 'number', default: 14, min: 0, max: 300, step: 1, label: '每轮载入短期几条' },
   // 2026-10-28：长期从「随机忆起」改成「近 N 天内权重最高的」。键名保留是为了不炸老 settings.json。
-  { key: 'loadLongRandom', type: 'number', default: 3, min: 0, max: 50, step: 1, label: '每轮载入长期几条（近 N 天内权重最高的）' },
+  { key: 'loadLongRandom', type: 'number', default: 10, min: 0, max: 300, step: 1, label: '每轮载入长期几条（近 N 天内权重最高的）' },
   { key: 'loadLongWindowDays', type: 'number', default: 60, min: 1, max: 365, step: 1, label: '长期只在最近几天内挑（默认 60 天）' },
-  { key: 'loadPermanentCount', type: 'number', default: 6, min: 0, max: 50, step: 1, label: '每轮载入永久几条' },
-  { key: 'budgetTokens', type: 'number', default: 1400, min: 200, max: 8000, step: 1, label: '注入预算（token）· 每轮聊天都会带上这段，调大同时增加聊天输入花费' },
+  { key: 'loadPermanentCount', type: 'number', default: 10, min: 0, max: 300, step: 1, label: '每轮载入永久几条（一级：权重最高）' },
+  // 2026-10-28：永久区分两级注入。
+  // 一级 = 权重最高的那几条（「我是谁」这种铁律，必须每轮都在）；
+  // 二级 = 从剩下的里随机抽，优先抽「离现在 ≥ loadPermanentSecondaryDays 天」的老记忆，
+  //        老的不够就从剩余部分随机补 —— 否则越老的东西永远进不了注入。
+  { key: 'loadPermanentSecondaryCount', type: 'number', default: 20, min: 0, max: 300, step: 1, label: '每轮载入永久几条（二级：老的随机）' },
+  { key: 'loadPermanentSecondaryDays', type: 'number', default: 60, min: 1, max: 730, step: 1, label: '二级只抽多少天以前的（按时间戳间隔算）' },
+  { key: 'budgetTokens', type: 'number', default: 3500, min: 200, max: 8000, step: 1, label: '注入预算（token）· 每轮聊天都会带上这段，调大同时增加聊天输入花费' },
 
   // ── 升级 / 淘汰门槛 ──────────────────────────────────────────────
   { key: 'promoteShortToLong', type: 'number', default: 0.55, min: 0, max: 1, step: 0.05, label: '短期→长期的权重门槛' },
@@ -124,7 +130,7 @@ export const CONFIG_SPEC = [
     // 又不会把「同一天发生的两件事」揉成一条。调高更保守，调低更主动。
     key: 'dedupThreshold',
     type: 'number',
-    default: 0.5,
+    default: 0.65,
     min: 0.3,
     max: 0.95,
     step: 0.05,

@@ -87,7 +87,7 @@ window.__ModuleLoader__.load({
       { title: '上下文总量（token）', keys: ['totalTokenCapacity', 'budgetTokens'] },
       { title: '记忆库自检（重复合并）', keys: ['dedupEnabled', 'dedupEveryEntries', 'dedupThreshold'] },
       { title: '周期与写入频率', keys: ['shortDays', 'longDays', 'writeEveryTurns'] },
-      { title: '每轮载入几条', keys: ['loadShortCount', 'loadLongRandom', 'loadPermanentCount'] },
+      { title: '每轮载入几条', keys: ['loadShortCount', 'loadLongRandom', 'loadPermanentCount', 'loadPermanentSecondaryCount', 'loadPermanentSecondaryDays'] },
       { title: '自动备份镜像（记忆 + 人格 + 配置）', keys: ['mirrorEnabled', 'mirrorEveryEntries', 'mirrorDir', 'mirrorExtraPaths'] },
       // 2026-10-27：频率和链路兜底。这几项都直接决定固化调模型的次数 ——
       // 调得越密，Token 花得越多，所以标题里就把话说明白。
@@ -872,11 +872,14 @@ window.__ModuleLoader__.load({
     const nShort = want('loadShortCount', 'short')
     const nLong = want('loadLongRandom', 'long')
     const nPerm = want('loadPermanentCount', 'permanent')
-    const n = nShort + nLong + nPerm
+    // 二级从「一级之外」的永久条目里抽，所以上限要先减掉一级用掉的那些
+    const permLeft = Math.max(0, (Number(counts.permanent) || 0) - nPerm)
+    const nPermSec = Math.max(0, Math.min(valueOfSetting('loadPermanentSecondaryCount') ?? 0, permLeft))
+    const n = nShort + nLong + nPerm + nPermSec
     const budget = valueOfSetting('budgetTokens') ?? 0
     const est = avg > 0 ? Math.round(n * avg) : 0
     const pct = budget > 0 && est > 0 ? Math.round((est / budget) * 100) : 0
-    const detail = `短 ${nShort} / 长 ${nLong} / 永 ${nPerm}`
+    const detail = `短 ${nShort} / 长 ${nLong} / 永 ${nPerm} + 老 ${nPermSec}`
     const text =
       est > 0
         ? `按现在的设置：每轮最多带 ${n} 条（${detail}），估算约 ${est} token，占注入上限 ${budget > 0 ? `${budget} token 的 ${pct}%` : '（未设）'}` +

@@ -264,11 +264,34 @@ export function renderInjection(p) {
     .slice(0, Math.max(0, loadLong))
     .sort(byTsDesc);
 
-  const permList = (Array.isArray(zones.permanent) ? zones.permanent : [])
+  /* 永久区两级注入（2026-10-28 用户要求）：
+     一级 = 权重最高的那几条 —— 「我是谁」这类铁律必须每轮都在；
+     二级 = 从**剩下**的里随机抽，优先抽「离现在 ≥ loadPermanentSecondaryDays 天」的老记忆，
+            老的不够就从剩余部分随机补 —— 否则越久的东西永远进不了注入（这正是用户提的问题）。
+     种子按小时变：同一小时内结果稳定（不改提示词缓存），跨小时才换一批。 */
+  const permAll = Array.isArray(zones.permanent) ? zones.permanent : [];
+  const permPrimary = permAll
     .slice()
     .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0) || (b.ts ?? 0) - (a.ts ?? 0))
-    .slice(0, Math.max(0, loadPerm))
-    .sort(byTsDesc);
+    .slice(0, Math.max(0, loadPerm));
+  const permPrimaryIds = new Set(permPrimary.map((entry) => String(entry?.id ?? '')));
+  const permRest = permAll.filter((entry) => !permPrimaryIds.has(String(entry?.id ?? '')));
+
+  const loadPermSec = Number.isFinite(Number(cfg.loadPermanentSecondaryCount))
+    ? Math.max(0, Number(cfg.loadPermanentSecondaryCount))
+    : 20;
+  const secDays = Number.isFinite(Number(cfg.loadPermanentSecondaryDays))
+    ? Math.max(1, Number(cfg.loadPermanentSecondaryDays))
+    : 60;
+  // 「按时间戳日间隔算」不是自然日：直接比毫秒差
+  const secCutoff = now - secDays * 86_400_000;
+  const permOldEnough = permRest.filter((entry) => (Number(entry?.ts) || 0) <= secCutoff);
+  const permSecPool = permOldEnough.length >= loadPermSec ? permOldEnough : permRest;
+  const permSecondary = loadPermSec > 0
+    ? sample(permSecPool, loadPermSec, (Math.floor(now / 3_600_000) ^ 0x85ebca6b) >>> 0)
+    : [];
+
+  const permList = permPrimary.concat(permSecondary).sort(byTsDesc);
 
   // 用户这轮**明确提起**的条目，归到「这轮想起来的」，而不是「最近发生的」。
   //
