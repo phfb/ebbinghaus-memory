@@ -1632,3 +1632,87 @@ test('配置分层：一个分区改了设置，不影响另一个分区', async
   assert.notEqual(workVal, 333, 'work 不该被 private 的改动带上');
   assert.equal(workVal, before, 'work 还是原来的值');
 });
+
+/* ── 2026-10-27：QQ 通道进不了记忆（source.kind = 'qq' 被当成注入消息挡掉） ── */
+
+test('QQ 转进来的消息也能触发固化（source.kind = qq）', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '他在 QQ 上说想我')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const agent = makeAgent('sess-qq', h.sections);
+  h.emit('agent/created', { agent });
+
+  // dsh-qq-bot 造的消息：source.kind 是 'qq'，不是 'user'（见它的 SOURCE_KIND）
+  h.emit('session/event', { id: 'sess-qq' }, {
+    type: 'user/message',
+    data: { source: { kind: 'qq', uin: '3448932873' }, content: [{ type: 'text', text: '在吗' }] },
+  });
+  h.emit('agent/turn-stopping', { agent });
+  await h.services.get('ebbinghausMemory').flush();
+
+  assert.equal(llm.calls.length, 1, 'QQ 消息必须能触发固化 —— 否则 QQ 上一句话都记不上');
+  assert.match(String(llm.calls[0].messages[0].content[0].text), /在吗/);
+});
+
+test('插件注入 / 子代理那类来源仍然一条都不收', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '不该出现')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const agent = makeAgent('sess-inject', h.sections);
+  h.emit('agent/created', { agent });
+
+  for (const kind of ['plugin', 'system', 'subagent', undefined]) {
+    h.emit('session/event', { id: 'sess-inject' }, {
+      type: 'user/message',
+      data: { source: kind === undefined ? undefined : { kind }, content: [{ type: 'text', text: '注入的内容' }] },
+    });
+  }
+  h.emit('agent/turn-stopping', { agent });
+  await h.services.get('ebbinghausMemory').flush();
+
+  assert.equal(llm.calls.length, 0, '非真人来源不能进 transcript，更不能触发固化');
+});
+
+test('连续失败会在 memory_stats 里带 ⚠ 提示（单次失败时不带）', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  // 没有 llm 服务 → 每次都走 no-model 分支
+  const h = makeCtx(null);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const agent = makeAgent('sess-streak', h.sections);
+  h.emit('agent/created', { agent });
+  const stats = h.services.get('ebbinghausMemory');
+  const statsTool = (h.tools ?? []).find((x) => x.name === 'memory_stats');
+
+  const runOnce = async (text) => {
+    h.emit('session/event', { id: 'sess-streak' }, {
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text }] },
+    });
+    h.emit('agent/turn-stopping', { agent });
+    await stats.flush();
+  };
+
+  await runOnce('第一轮');
+  if (statsTool === undefined) return; // 桩里没注册工具就跳过
+  let out = await statsTool.execute({});
+  let last = out.lines[out.lines.length - 1];
+  assert.match(last, /^上次固化：/);
+  assert.doesNotMatch(last, /连续/, '只失败一次不给警告，免得和「没到该记的时候」混淆');
+
+  await runOnce('第二轮');
+  out = await statsTool.execute({});
+  last = out.lines[out.lines.length - 1];
+  assert.match(last, /已连续 2 次没写进去/, '连续失败必须显式说出来');
+});

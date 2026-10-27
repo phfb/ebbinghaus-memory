@@ -138,6 +138,28 @@ const CONSOLIDATE_TAIL = 14;
 const MAX_CONSOLIDATE_TOKENS = 8000;
 /** 单条消息送进模型前截断的字符数（防一次长贴图把 maxTokens 吃光）。 */
 const MAX_MESSAGE_CHARS = 1200;
+/**
+ * 算数「他亲手打的字」的来源白名单。
+ *
+ * - `user`：桌面端 / 网页端直接输入
+ * - `qq`  ：dsh-qq-bot 转进来的 QQ 私聊（它的 `SOURCE_KIND = 'qq'`）
+ *
+ * 白名单之外的一律不收：子代理任务书、系统注入、插件自发的提醒都不是
+ * 「他和我」的对话，收进去只会长出「core-agent 在写 zones.mjs」这种记忆。
+ */
+const USER_SOURCE_KINDS = Object.freeze(['user', 'qq']);
+/**
+ * 认定「这次固化算失败」的结果码 —— 用来累计连续失败次数。
+ * `nothing-worth`（模型判断不值得记）和 `ok` 不算失败：那是正常工作。
+ */
+const FAILURE_OUTCOMES = Object.freeze([
+  'no-model',
+  'model-error',
+  'truncated',
+  'empty',
+  'parse-failed',
+  'no-valid',
+]);
 /** 面板每区一次最多回多少条（§ lead 冻结）。 */
 const PANEL_MAX_ENTRIES = 50;
 /** HTTP 请求体上限。我们只收 id / zone / 几个数字，8KB 足够。 */
@@ -1157,8 +1179,18 @@ export function apply(ctx, rawConfig) {
       const s = stateOf(id);
 
       if (event?.type === 'user/message') {
-        // 必须过滤掉注入进来的消息，只要真人打的字
-        if (event.data?.source?.kind !== 'user') return;
+        // 只要「他亲手打的字」。桌面端直接输入是 `user`；QQ 由 dsh-qq-bot 转进来，
+        // 它的 source.kind 是 `qq`（见 qq-bot 的 `SOURCE_KIND = 'qq'`），**不是 user**。
+        //
+        // 2026-10-27：这里原本写死 `!== 'user'` 就 return，等于把 QQ 这条唯一的日常
+        // 通道整个挡在门外 —— QQ 会话的 turn 永远是 0、transcript 永远空，闸门那条
+        // `if (s.turn === 0 || s.lastUserText === '')` 永远拦下，**一条记忆都写不进去**，
+        // 而读是正常的（注入走全局渲染，跟 turn 无关）。症状就是「聊了一整天，
+        // 记忆面板里一条新的都没有」。
+        //
+        // 用白名单而不是黑名单：以后再加来源（别的客户端、别的入口）只要往
+        // USER_SOURCE_KINDS 里添一项，不用回来改这里的判断。
+        if (!USER_SOURCE_KINDS.includes(event.data?.source?.kind)) return;
         const text = (event.data?.content ?? [])
           .filter((b) => b?.type === 'text')
           .map((b) => b.text)
@@ -1246,10 +1278,17 @@ export function apply(ctx, rawConfig) {
   const PENDING_RECALL_MS = 10 * 60 * 1000;
 
   let lastAttempt = { at: 0, outcome: 'never', added: 0 };
+  /**
+   * 连续失败次数。**单次失败和「还没到该记的时候」在界面上长得一模一样**，
+   * 连着两次以上才是真出事了 —— 所以单独攒一个计数，让 memory_stats 直接说出来。
+   */
+  let consecutiveFailures = 0;
 
   /** @param {string} outcome @param {number} [added] */
   function noteAttempt(outcome, added = 0) {
     lastAttempt = { at: Date.now(), outcome, added, total: store.all().length };
+    if (outcome === 'ok') consecutiveFailures = 0;
+    else if (FAILURE_OUTCOMES.includes(outcome)) consecutiveFailures += 1;
     return undefined;
   }
 
@@ -2362,7 +2401,10 @@ export function apply(ctx, rawConfig) {
         'nothing-worth': '模型判断这段不值得记',
         'no-valid': '条目没通过校验，一条都没写',
       }[lastAttempt.outcome] ?? lastAttempt.outcome;
-    return `上次固化：${when} · ${label}`;
+    // 连着两次以上才提示：单次失败可能只是「模型这次判断没什么值得记的」，
+    // 但连续失败一定是链路坏了 —— 而这两种情况以前在界面上长得一模一样。
+    const streak = consecutiveFailures >= 2 ? ` · ⚠ 已连续 ${consecutiveFailures} 次没写进去` : '';
+    return `上次固化：${when} · ${label}${streak}`;
   }
 
   /**
