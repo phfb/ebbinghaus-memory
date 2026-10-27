@@ -503,6 +503,7 @@ test('HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
   assert.deepEqual(paths, [
     '/ebbinghaus/compress',
     '/ebbinghaus/dedup',
+    '/ebbinghaus/diagnostics',
     '/ebbinghaus/export',
     '/ebbinghaus/forget',
     '/ebbinghaus/harvest',
@@ -1903,7 +1904,7 @@ test('连续固化失败后，注入段会带「记忆插件异常」告警；�
   await say('第二轮');
   const sick = svc.renderFor('sess-health');
   assert.match(sick, /记忆插件异常/, '连续两次没写进去，注入段必须说出来');
-  assert.match(sick, /去看日志|看日志/, '得告诉对方去哪儿查');
+  assert.match(sick, /复制诊断/, '得告诉对方怎么把问题交出来');
 
   // 恢复正常
   bad = false;
@@ -1933,4 +1934,77 @@ test('手动暂停模型调用时，注入段说明「新对话不会进记忆�
   assert.equal(llm.calls.length, 0, '暂停时不该调模型');
   const text = h.services.get('ebbinghausMemory').renderFor('sess-paused');
   assert.match(text, /记忆插件已暂停/);
+});
+
+/* ── 2026-10-27：开源后的反馈链路（诊断报告 / 来源白名单可配） ── */
+
+test('诊断报告：带版本和链路，但不含记忆正文和密钥', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '这句是记忆正文不该出现在诊断里')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const agent = makeAgent('sess-diag', h.sections);
+  h.emit('agent/created', { agent });
+  h.emit('session/event', { id: 'sess-diag' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '这句是对话正文也不该出现' }] },
+  });
+  h.emit('agent/turn-stopping', { agent });
+  const svc = h.services.get('ebbinghausMemory');
+  await svc.flush();
+
+  const text = svc.diagnostics();
+  assert.equal(typeof text, 'string');
+  assert.match(text, /ebbinghaus-memory v/, '要带版本号');
+  assert.match(text, /当前路由：/, '要带当前路由');
+  assert.match(text, /最近固化/, '要带最近固化记录');
+  assert.ok(!text.includes('这句是对话正文也不该出现'), '诊断里不能出现对话正文');
+  assert.ok(!text.includes('这句是记忆正文不该出现在诊断里'), '诊断里不能出现记忆内容');
+  assert.ok(!/sk-|bearer|api[_-]?key/i.test(text), '诊断里不能出现任何密钥样式的串');
+});
+
+test('sourceKinds 可配置：换成别的桥接名字也能收到消息', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '来自 telegram 桥接的一句')]) });
+  const h = makeCtx(llm);
+  // 别人接的是 telegram 桥接，source.kind 不叫 user 也不叫 qq
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1, sourceKinds: 'user,qq,telegram' });
+
+  const agent = makeAgent('sess-tg', h.sections);
+  h.emit('agent/created', { agent });
+  h.emit('session/event', { id: 'sess-tg' }, {
+    type: 'user/message',
+    data: { source: { kind: 'telegram' }, content: [{ type: 'text', text: '在吗' }] },
+  });
+  h.emit('agent/turn-stopping', { agent });
+  await h.services.get('ebbinghausMemory').flush();
+
+  assert.equal(llm.calls.length, 1, '配置里写进去的来源必须能触发固化');
+});
+
+test('sourceKinds 没列到的来源仍然不收', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '不该出现')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1, sourceKinds: 'user,qq' });
+
+  const agent = makeAgent('sess-tg2', h.sections);
+  h.emit('agent/created', { agent });
+  h.emit('session/event', { id: 'sess-tg2' }, {
+    type: 'user/message',
+    data: { source: { kind: 'telegram' }, content: [{ type: 'text', text: '在吗' }] },
+  });
+  h.emit('agent/turn-stopping', { agent });
+  await h.services.get('ebbinghausMemory').flush();
+
+  assert.equal(llm.calls.length, 0, '没列进白名单的来源不能触发固化');
 });

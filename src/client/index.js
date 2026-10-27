@@ -1113,6 +1113,9 @@ window.__ModuleLoader__.load({
       const [settingsDraft, setSettingsDraft] = useState({});
       const [settingsNotice, setSettingsNotice] = useState('');
       const [dedupNotice, setDedupNotice] = useState('');
+      /** 「复制诊断」的状态提示 + 剪贴板不可用时的兜底文本 */
+      const [diagNotice, setDiagNotice] = useState('');
+      const [diagText, setDiagText] = useState('');
 
       useEffect(() => {
         let alive = true;
@@ -1295,6 +1298,33 @@ window.__ModuleLoader__.load({
        * 「立刻自检」—— 手动跑一次重复合并。
        * 纯本地算法，毫秒级，所以能等它跑完再刷新（用户点了按钮就该看到结果）。
        */
+      /** 生成诊断文本并尽量塞进剪贴板（不给权限就摊在框里让人手抄）。 */
+      function copyDiagnostics() {
+        setDiagNotice('正在生成…');
+        setDiagText('');
+        fetch(`${API}/diagnostics`, { headers: { Accept: 'application/json' } })
+          .then((r) => (r && typeof r.json === 'function' ? r.json() : {}))
+          .then(async (d) => {
+            const text = typeof d?.text === 'string' ? d.text : '';
+            if (text === '') {
+              setDiagNotice('生成失败：没拿到内容');
+              return;
+            }
+            try {
+              if (!navigator || !navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+                throw new Error('no clipboard');
+              }
+              await navigator.clipboard.writeText(text);
+              setDiagNotice('已复制到剪贴板 —— 直接贴进 issue 就行');
+            } catch {
+              // 浏览器不给剪贴板权限（非安全上下文常见）：摊在框里，手动全选复制
+              setDiagText(text);
+              setDiagNotice('剪贴板不可用，内容在下面，手动全选复制');
+            }
+          })
+          .catch(() => setDiagNotice('生成失败，看看控制台'));
+      }
+
       function runDedup() {
         setBusy('自检');
         setDedupNotice('');
@@ -1564,6 +1594,9 @@ window.__ModuleLoader__.load({
       }
 
       /* 固化日志：只给形状（时间 / 结果 / 条数 / 链路），不含对话正文 */
+      const diagInfo = isObj(d.consolidate) ? d.consolidate : {};
+      const pluginVersion = String(diagInfo.version ?? '');
+      const repoUrl = String(diagInfo.repo ?? '');
       const chainInfo = isObj(d.consolidate) && isObj(d.consolidate.chain) ? d.consolidate.chain : {};
       const logRows =
         isObj(d.consolidate) && Array.isArray(d.consolidate.log)
@@ -1623,6 +1656,52 @@ window.__ModuleLoader__.load({
                 ),
               ),
             ),
+        // 「复制诊断」+「报告问题」：开源之后用户不用知道日志在哪，
+        // 点一下拿到一段脱敏的纯文本，贴进 issue 就行。
+        h(
+          'div',
+          { style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginTop: 10 } },
+          h(
+            'button',
+            {
+              type: 'button',
+              onClick: copyDiagnostics,
+              title: '生成一段脱敏的诊断文本（版本 / 路由 / 最近几次固化的结果），直接贴进 issue',
+              style: chipStyle(C.brand, false),
+            },
+            '复制诊断',
+          ),
+          repoUrl
+            ? h(
+                'a',
+                {
+                  href: `${repoUrl}/issues/new?title=${encodeURIComponent(`[v${pluginVersion || '?'}] 固化问题：`)}`,
+                  target: '_blank',
+                  rel: 'noreferrer',
+                  style: { fontSize: 11, color: C.brand, textDecoration: 'none' },
+                },
+                '报告问题',
+              )
+            : null,
+        ),
+        diagNotice
+          ? h('div', { style: { marginTop: 6, fontSize: 11, color: C.text2 } }, diagNotice)
+          : null,
+        diagText
+          ? h('textarea', {
+              readOnly: true,
+              value: diagText,
+              'aria-label': '诊断文本',
+              style: {
+                marginTop: 6,
+                width: '100%',
+                minHeight: 140,
+                fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+                fontSize: 11,
+                color: C.text2,
+              },
+            })
+          : null,
       );
 
       const dedupBody = h(

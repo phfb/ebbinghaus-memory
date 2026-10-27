@@ -42,6 +42,10 @@ export const CONFIG_SPEC = [
 
   // ── 写入频率 ─────────────────────────────────────────────────────
   { key: 'writeEveryTurns', type: 'number', default: 2, min: 1, max: 30, step: 1, label: '每几轮对话固化一次（1-30 轮，会话第一轮必写）· 频率越高越费 Token' },
+  // 哪些 source.kind 算「他亲手打的字」。
+  // 这不只是洁癖：别的桥接插件（其它 QQ 框架 / Telegram / Discord / 自建客户端）
+  // 用的 kind 各不相同，写死就会**一条都记不上而且不报错**，症状跟坏了没法区分。
+  { key: 'sourceKinds', type: 'string', default: 'user,qq', label: '哪些来源算他说的话（逗号分隔）· 换桥接就把它的 source.kind 加进来' },
   // 两次固化之间的最小间隔：防「连着几轮疯狂触发」把并发和额度一起打爆。
   // **默认 0 = 不限制**，保持「攒够 writeEveryTurns 轮就写」的既有语义；
   // 想降频（比如怕被 API 风控）就调到 60~300。
@@ -234,6 +238,7 @@ export const TUNABLE_KEYS = Object.freeze([
   'shortDays',
   'longDays',
   'writeEveryTurns',
+  'sourceKinds',
   'shortCapacity',
   'longCapacity',
   'permanentCapacity',

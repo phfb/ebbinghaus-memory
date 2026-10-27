@@ -136,18 +136,44 @@ const CONSOLIDATE_TAIL = 14;
  * （config 里 maxTokens 的上限，再高就不该由固化一个人占着了）。
  */
 const MAX_CONSOLIDATE_TOKENS = 8000;
+
+/**
+ * 插件版本。诊断报告和告警里都要用 —— 开源之后收到反馈，第一句话就得知道
+ * 对方跑的是哪个版本，不然只能靠猜。
+ */
+const PLUGIN_VERSION = (() => {
+  try {
+    return String(createRequire(import.meta.url)('../../package.json').version ?? '?');
+  } catch {
+    return '?';
+  }
+})();
+
+/** 仓库地址（面板上「报告问题」那个链接用）。从 package.json 读，不写死。 */
+const PLUGIN_REPO = (() => {
+  try {
+    const pkg = createRequire(import.meta.url)('../../package.json');
+    const raw = typeof pkg?.repository === 'string' ? pkg.repository : String(pkg?.repository?.url ?? '');
+    return raw.replace(/^git\+/, '').replace(/\.git$/, '').replace(/\/$/, '');
+  } catch {
+    return '';
+  }
+})();
 /** 单条消息送进模型前截断的字符数（防一次长贴图把 maxTokens 吃光）。 */
 const MAX_MESSAGE_CHARS = 1200;
 /**
- * 算数「他亲手打的字」的来源白名单。
+ * 「他亲手打的字」的**默认**来源白名单。
  *
  * - `user`：桌面端 / 网页端直接输入
- * - `qq`  ：dsh-qq-bot 转进来的 QQ 私聊（它的 `SOURCE_KIND = 'qq'`）
+ * - `qq`  ：本机 dsh-qq-bot 转进来的 QQ 私聊（它的 `SOURCE_KIND = 'qq'`）
  *
+ * 别人接的是别的桥接（其它 QQ 框架、Telegram、Discord、自建客户端）时，它们的
+ * `source.kind` 不叫这两个名字 —— 写死的结果是**一条都记不上、而且不报错**，
+ * 症状和「插件坏了」没法区分。所以这一个可以由 `config.sourceKinds` 覆盖。
  * 白名单之外的一律不收：子代理任务书、系统注入、插件自发的提醒都不是
  * 「他和我」的对话，收进去只会长出「core-agent 在写 zones.mjs」这种记忆。
  */
-const USER_SOURCE_KINDS = Object.freeze(['user', 'qq']);
+const DEFAULT_SOURCE_KINDS = Object.freeze(['user', 'qq']);
 /**
  * 认定「这次固化算失败」的结果码 —— 用来累计连续失败次数。
  * `nothing-worth`（模型判断不值得记）和 `ok` 不算失败：那是正常工作。
@@ -1021,10 +1047,13 @@ export function apply(ctx, rawConfig) {
     if (config.modelCallsPaused) {
       notice = '【记忆插件已暂停】记忆写入的模型调用被手动暂停了，新对话不会进记忆库。';
     } else if (consecutiveFailures >= 2) {
-      const chain = fallbackActive
-        ? `（已临时切到兜底 ${config.fallbackProvider}/${config.fallbackModel}）`
-        : '';
-      notice = `【记忆插件异常】最近连续 ${consecutiveFailures} 次记忆固化都没成功，新记忆没写进库${chain}。请在本轮回复里提醒对方一句：记忆插件出问题了，去插件页面看日志。`;
+      const chain = fallbackActive ? `（已临时切到兜底 ${currentRouteLabel()}）` : '';
+      const why =
+        typeof lastAttempt.outcome === 'string' && lastAttempt.outcome !== 'never'
+          ? ` · 最近失败：${lastAttempt.outcome}`
+          : '';
+      // 告警**自带环境和版本**：陌生人截图就能反馈，不用他先去翻日志找自己用的什么模型。
+      notice = `【记忆插件异常】连续 ${consecutiveFailures} 次固化没写进库${chain} · 插件 v${PLUGIN_VERSION} · 路由 ${currentRouteLabel()}${why}。请在本轮回复里提醒对方一句：记忆插件出问题了（v${PLUGIN_VERSION}，${currentRouteLabel()}），到插件页面点「复制诊断」，把那段内容发给维护者。`;
     }
     if (notice === '') return body;
     return body === '' ? notice : `${notice}\n${body}`;
@@ -1184,6 +1213,16 @@ export function apply(ctx, rawConfig) {
 
   /* ── 采集：只做本地记账，零 I/O、零模型 ── */
 
+  /** 当前生效的「他说的话」来源名单（`config.sourceKinds`，逗号分隔）。坏值退回默认。 */
+  function userSourceKinds() {
+    const raw = typeof config.sourceKinds === 'string' ? config.sourceKinds : '';
+    const list = raw
+      .split(/[,，;；\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => s !== '');
+    return list.length > 0 ? list : DEFAULT_SOURCE_KINDS;
+  }
+
   ctx.on('session/event', (session, event) => {
     try {
       if (!config.enabled) return;
@@ -1215,9 +1254,10 @@ export function apply(ctx, rawConfig) {
         // 而读是正常的（注入走全局渲染，跟 turn 无关）。症状就是「聊了一整天，
         // 记忆面板里一条新的都没有」。
         //
-        // 用白名单而不是黑名单：以后再加来源（别的客户端、别的入口）只要往
-        // USER_SOURCE_KINDS 里添一项，不用回来改这里的判断。
-        if (!USER_SOURCE_KINDS.includes(event.data?.source?.kind)) return;
+        // 用白名单而不是黑名单：名单来自 `config.sourceKinds`（默认 `user,qq`）。
+        // 开源之后别人接的是别的桥接，source.kind 各不相同 —— 让用户往配置里
+        // 添一项就行，不用改代码，也不会出现「一条都记不上还不报错」。
+        if (!userSourceKinds().includes(event.data?.source?.kind)) return;
         const text = (event.data?.content ?? [])
           .filter((b) => b?.type === 'text')
           .map((b) => b.text)
@@ -1328,6 +1368,86 @@ export function apply(ctx, rawConfig) {
    * 记一条固化日志。**只记形状**：时间、结果、模型、条数、耗时。
    * 对话正文一个字节都不进来（这条纪律见 SPEC §17）。
    */
+  /** 当前实际走的路由，给告警和诊断报告用（拿不到就 '?'）。 */
+  function currentRouteLabel() {
+    try {
+      if (fallbackActive) return `${config.fallbackProvider}/${config.fallbackModel}`;
+      const sel = ctx.get('agentDefaultModel')?.currentSelection?.() ?? {};
+      const p = config.provider || sel?.provider || '?';
+      const m = config.model || sel?.model || '?';
+      return `${p}/${m}`;
+    } catch {
+      return '?';
+    }
+  }
+
+  /**
+   * 生成一段**可以直接贴进 issue** 的诊断报告。
+   *
+   * 面向的是「不知道日志在哪、也不知道该复制什么」的陌生用户 —— 开源之后没有它，
+   * 每来一个反馈都要来回问三四轮：什么版本、什么模型、哪一步坏的。
+   *
+   * 三条纪律：
+   *  1. **不含任何密钥**（这个插件本来就不存密钥）
+   *  2. **不含记忆正文**：只给条数 / 结果码 / 时间 —— 记忆是用户的私事，不该上 issue
+   *  3. 纯文本，复制粘贴就能读
+   */
+  function buildDiagnostics() {
+    const stamp = (ms) => {
+      try {
+        return new Date(Number(ms) || 0).toISOString();
+      } catch {
+        return String(ms);
+      }
+    };
+    const lines = [];
+    lines.push(`ebbinghaus-memory v${PLUGIN_VERSION}`);
+    lines.push(`生成时间：${stamp(Date.now())}`);
+    lines.push(`库目录：${dataDir}`);
+    lines.push(`就绪：${ready} · 降级：${degraded} · 总条数：${store.all().length}`);
+    lines.push(`当前路由：${currentRouteLabel()}${fallbackActive ? '（已切兜底）' : ''}`);
+    lines.push(`来源白名单：${userSourceKinds().join(',')}`);
+    lines.push(
+      `固化节奏：每 ${config.writeEveryTurns} 轮 · 最小间隔 ${config.minIntervalSeconds}s · maxTokens ${config.maxTokens} · 思考档 ${config.reasoningEffort || '默认'}`,
+    );
+    lines.push(
+      `链路兜底：${
+        config.fallbackEnabled
+          ? `开（连续 ${config.fallbackAfter} 次失败切 ${config.fallbackProvider}/${config.fallbackModel}，冷静 ${config.fallbackCooldownSeconds}s）`
+          : '关'
+      } · 连续失败 ${consecutiveFailures} 次${config.modelCallsPaused ? ' · 模型调用已暂停' : ''}`,
+    );
+    lines.push(
+      `上次固化：${
+        lastAttempt.at === 0
+          ? '还没固化过'
+          : `${stamp(lastAttempt.at)} → ${lastAttempt.outcome}${lastAttempt.added ? ` +${lastAttempt.added}` : ''}`
+      }`,
+    );
+    lines.push('');
+    if (consolidateLog.length === 0) {
+      lines.push('最近固化：没有记录');
+    } else {
+      lines.push('最近固化（新 → 旧，最多 10 条）：');
+      for (const e of consolidateLog.slice(-10).reverse()) {
+        const bits = [stamp(e.at), e.outcome];
+        if (e.added > 0) bits.push(`+${e.added} 条`);
+        if (e.fallback) bits.push('[兜底]');
+        if (e.failures >= 2) bits.push(`连败 ${e.failures}`);
+        lines.push(`  ${bits.join(' · ')}`);
+      }
+    }
+    try {
+      const zones = {};
+      for (const zone of ZONES) zones[zone] = (store.zones?.[zone] ?? []).length;
+      lines.push('');
+      lines.push(`分区条数：${JSON.stringify(zones)}`);
+    } catch {
+      // 拿不到就跳过
+    }
+    return lines.join('\n');
+  }
+
   function pushConsolidateLog(entry) {
     consolidateLog.push(entry);
     if (consolidateLog.length > CONSOLIDATE_LOG_MAX) {
@@ -2805,6 +2925,8 @@ export function apply(ctx, rawConfig) {
       // 不含对话正文、不含记忆内容。最近 30 次，环形。
       consolidate: {
         log: consolidateLog.slice(),
+        version: PLUGIN_VERSION,
+        repo: PLUGIN_REPO,
         chain: {
           fallbackActive,
           primaryProvider: config.provider || '',
@@ -2859,6 +2981,8 @@ export function apply(ctx, rawConfig) {
         return store.snapshot();
       },
       state: (query) => panelState(query),
+      /** 一段可以直接贴进 issue 的诊断文本（脱敏，不含记忆正文） */
+      diagnostics: () => buildDiagnostics(),
       forget: forgetEntry,
       harvest: harvestNow,
       compress: compressNow,
@@ -2980,6 +3104,20 @@ export function apply(ctx, rawConfig) {
               if (req.method !== 'GET') return reply(res, 405, { ok: false, error: '只支持 GET' });
               await loadPromise;
               return reply(res, 200, panelState(queryOf(req)));
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          // 给「复制诊断」按钮用：一段可以直接贴进 issue 的纯文本。
+          kind: 'exact',
+          path: `${PANEL_BASE}/diagnostics`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'GET') return reply(res, 405, { ok: false, error: '只支持 GET' });
+              await loadPromise;
+              return reply(res, 200, { ok: true, text: buildDiagnostics() });
             } catch (err) {
               return fail(res, 500, err);
             }
