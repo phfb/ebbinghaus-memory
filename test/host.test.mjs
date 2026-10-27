@@ -2008,3 +2008,90 @@ test('sourceKinds 没列到的来源仍然不收', async (t) => {
 
   assert.equal(llm.calls.length, 0, '没列进白名单的来源不能触发固化');
 });
+
+/* ── 2026-10-27：bot 记忆专区（不接 QQ 的人默认关着，完全不影响行为） ── */
+
+/** 发一条带来源的消息并等固化落地。 */
+async function sayWithSource(h, agent, sessionId, text, source) {
+  h.emit('session/event', { id: sessionId }, {
+    type: 'user/message',
+    data: { source, content: [{ type: 'text', text }] },
+  });
+  h.emit('agent/turn-stopping', { agent });
+  await h.services.get('ebbinghausMemory').flush();
+}
+
+function readBindings(dir) {
+  try {
+    return JSON.parse(readFileSync(path.join(dir, 'space-bindings.json'), 'utf8')).bindings ?? {};
+  } catch {
+    return {};
+  }
+}
+
+test('bot 专区：开关开着 + 号对得上 → 会话绑到指定分区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir); // private(active) + work
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, 'QQ 上的一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '3448932873',
+  });
+
+  const agent = makeAgent('sess-bot', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-bot', '在吗', { kind: 'qq', uin: '3448932873' });
+
+  assert.equal(readBindings(dir)['sess-bot'], 'work', 'QQ 会话要绑到 bot 专区');
+});
+
+test('bot 专区：号不在名单里 / 开关关着 → 还是跟着默认分区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir);
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '3448932873',
+  });
+
+  const agent = makeAgent('sess-other', h.sections);
+  h.emit('agent/created', { agent });
+  // 不是名单里那个号
+  await sayWithSource(h, agent, 'sess-other', '在吗', { kind: 'qq', uin: '999999' });
+
+  assert.equal(readBindings(dir)['sess-other'], 'private', '号对不上就不该进专区');
+});
+
+test('bot 专区：指定的分区不存在时不崩，退回默认分区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir);
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: '没这个分区',
+    botUins: '',
+  });
+
+  const agent = makeAgent('sess-nospace', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-nospace', '在吗', { kind: 'qq', uin: '1' });
+
+  assert.equal(readBindings(dir)['sess-nospace'], 'private', '分区不存在要退回默认，而不是报错');
+});

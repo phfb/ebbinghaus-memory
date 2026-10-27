@@ -46,6 +46,14 @@ export const CONFIG_SPEC = [
   // 这不只是洁癖：别的桥接插件（其它 QQ 框架 / Telegram / Discord / 自建客户端）
   // 用的 kind 各不相同，写死就会**一条都记不上而且不报错**，症状跟坏了没法区分。
   { key: 'sourceKinds', type: 'string', default: 'user,qq', label: '哪些来源算他说的话（逗号分隔）· 换桥接就把它的 source.kind 加进来' },
+
+  // ── bot 记忆专区 ────────────────────────────────────────────────
+  // 很多人并不接 QQ bot。所以这一整块默认关着，关着就完全不影响行为（跟 0.8.x 之前一样）。
+  // 开了之后：桥接（QQ 之类）来的会话单独绑到一个分区，跟桌面端那些分开存，
+  // 互不干扰 —— 桌面端不会读到 QQ 上的碎碎念，QQ 那边也不会翻到桌面的活。
+  { key: 'botSpaceEnabled', type: 'boolean', default: false, label: '启用 bot 记忆专区 · 把 QQ 这类桥接的记忆跟桌面端分开放' },
+  { key: 'botSpaceId', type: 'string', default: '', label: 'bot 专区用哪个分区（填分区 id，面板里能看到；留空 = 不分区）' },
+  { key: 'botUins', type: 'string', default: '', label: '只把这些 QQ 号的消息存进专区（逗号分隔；留空 = 桥接来的全算）' },
   // 两次固化之间的最小间隔：防「连着几轮疯狂触发」把并发和额度一起打爆。
   // **默认 0 = 不限制**，保持「攒够 writeEveryTurns 轮就写」的既有语义；
   // 想降频（比如怕被 API 风控）就调到 60~300。

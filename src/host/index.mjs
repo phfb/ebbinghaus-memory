@@ -790,8 +790,50 @@ export function apply(ctx, rawConfig) {
   }
 
   /** 会话第一次出现就钉住分区；已经钉过的不动。 */
-  function bindSessionIfNew(sessionId) {
-    if (!bindIfNew(bindings, sessionId, activeSpaceId)) return;
+  /**
+   * bot 记忆专区：这条消息该不该单独进某个分区。
+   *
+   * 返回分区 id，或者 `undefined`（表示「跟着当前激活分区」，就是老行为）。
+   *
+   * 三种情况都退回 undefined，一种都不硬来：
+   *  - 开关没开（绝大多数人根本不接 bot，关着就完全没有影响）
+   *  - 来源不在白名单里，或者不在 `botUins` 指定的号里
+   *  - 指定的分区不存在（**不自动建目录** —— 乱建比不建更难收拾）
+   */
+  function spaceForIncoming(source) {
+    if (!config.botSpaceEnabled) return undefined;
+    const kind = source?.kind;
+    if (typeof kind !== 'string' || !userSourceKinds().includes(kind)) return undefined;
+
+    const uins = botUins();
+    if (uins.length > 0) {
+      const uin = String(source?.uin ?? '').trim();
+      if (uin === '' || !uins.includes(uin)) return undefined;
+    }
+
+    const target = typeof config.botSpaceId === 'string' ? config.botSpaceId.trim() : '';
+    if (target === '') return undefined;
+    const exists = (spaceInfo.spaces ?? []).some((sp) => sp.id === target);
+    if (!exists) {
+      warn(`bot 记忆专区的分区「${target}」不存在，这条先跟着默认分区走（面板里能看到有哪些分区）`);
+      return undefined;
+    }
+    return target;
+  }
+
+  /** `botUins` 解析成数组。空 / 坏值 → 空数组（= 不按号过滤）。 */
+  function botUins() {
+    const raw = typeof config.botUins === 'string' ? config.botUins : '';
+    return raw
+      .split(/[,，;；\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => s !== '');
+  }
+
+  function bindSessionIfNew(sessionId, source) {
+    // bot 专区命中就绑专区，否则还是绑当前激活分区（老行为）
+    const target = spaceForIncoming(source) ?? activeSpaceId;
+    if (!bindIfNew(bindings, sessionId, target)) return;
     persistBindings();
   }
 
@@ -1241,7 +1283,9 @@ export function apply(ctx, rawConfig) {
       const id = session?.id;
       if (typeof id !== 'string' || id === '') return;
       // 会话第一次出现就把它钉在当前分区上：之后再切，这个会话也不会被抢走。
-      bindSessionIfNew(id);
+      // 绑分区时要看来源：bot 来的（QQ 之类）可能要落到「bot 记忆专区」。
+      // 只有 user/message 带得动 source，别的事件按默认分区绑。
+      bindSessionIfNew(id, event?.type === 'user/message' ? event?.data?.source : undefined);
       const s = stateOf(id);
 
       if (event?.type === 'user/message') {
