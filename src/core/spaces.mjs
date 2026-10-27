@@ -32,7 +32,7 @@ export const TRASH_DIR = '_trash';
 export const MAX_SPACES = 10;
 /** 老库迁移过去时的分区 id 与显示名。 */
 export const DEFAULT_SPACE_ID = 'private';
-export const DEFAULT_SPACE_NAME = '私生活';
+export const DEFAULT_SPACE_NAME = '个人';
 
 /**
  * 「库根里属于老库的文件」—— 迁移时只看这些。

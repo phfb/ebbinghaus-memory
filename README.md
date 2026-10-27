@@ -348,7 +348,7 @@ node tools\dedup.mjs --apply            # 真合并（先自动冷存档）
 <库根>\
   spaces.json              注册表：有哪些分区、当前激活哪个
   spaces\
-    private\               一个分区 = 以前的一整个库（显示名「私生活」）
+    private\               一个分区 = 以前的一整个库（显示名「个人」）
       short.jsonl  long.jsonl  permanent.jsonl
       meta.json  settings.json  dedup-state.json  mirror-state.json
       _archive\
@@ -359,7 +359,7 @@ node tools\dedup.mjs --apply            # 真合并（先自动冷存档）
 
 - **最多 10 个**分区；分区 id 只能是 ASCII 小写字母/数字/`-`/`_`（它同时是目录名），显示名可以中文
 - **老库自动迁移**：第一次用这版启动时，发现根目录还是老结构，就整体搬进 `spaces\private\`，
-  显示名「私生活」。流程是**先复制 → 校验三个分区的条数 → 通过了才删原件**；
+  显示名「个人」。流程是**先复制 → 校验三个分区的条数 → 通过了才删原件**；
   任何一步不对就回滚，老库一个字节都不动，插件退回「直接用库根当库」的降级模式
 - **镜像按分区隔离**：同步时落到 `<镜像目录>\<分区id>\`，每个分区一套清单 + 恢复程序
 
@@ -393,7 +393,7 @@ node tools\dedup.mjs --apply            # 真合并（先自动冷存档）
 - **接口**：`POST /ebbinghaus/spaces/active { id }`
 
 规则：**切换只影响之后新开的对话**。已经聊着的会话，在它出现的那一刻就被钉在了当时的分区，
-之后你怎么切都不会动它 —— 这样「私生活」里聊着的东西不会突然变成「工作」的记忆。
+之后你怎么切都不会动它 —— 这样「个人」里聊着的东西不会突然变成「工作」的记忆。
 
 钉住的记录落在 `<库根>\space-bindings.json`（会话 id → 分区 id）。想让某个会话改跟别的分区：
 `POST /ebbinghaus/spaces/bind { sessionId, id }`；想让它重新跟随当前分区：

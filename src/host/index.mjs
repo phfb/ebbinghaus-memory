@@ -848,7 +848,7 @@ export function apply(ctx, rawConfig) {
       .sort((a, b) => b.at - a.at);
     const locked = botSpace.lockedAt > 0 && botSpace.spaceId.trim() !== '';
     const id = botSpaceId();
-    // 「私生活（private）」这种两个都给的写法：光给 id 谁也看不懂，
+    // 「个人（private）」这种两个都给的写法：光给 id 谁也看不懂，
     // 光给名字又跟 spaces.json / 目录名对不上，维护时两边都要。
     const hit = list.find((s) => s.id === id);
     const spaceLabel = id === '' ? '' : hit && hit.name ? `${hit.name}（${id}）` : id;
