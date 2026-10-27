@@ -186,6 +186,13 @@ const FAILURE_OUTCOMES = Object.freeze([
   'empty',
   'parse-failed',
   'no-valid',
+  /* 2026-10-28 加：这两种以前根本不进账。
+     `timeout` —— 模型挂死、等到 jobTimeoutMs 被掐断。原来只 warn 一句就 return，
+     面板永远停在「还没固化过」，那条「连续 N 次没写进库」的告警一辈子不响，
+     而她「哑了」的时候，人就是靠那条提示判断的。
+     `exception` —— 落盘 / 未预期异常（含新加的「保存失败要抛」）。以前也只 warn。 */
+  'timeout',
+  'exception',
 ]);
 /** 面板每区一次最多回多少条（§ lead 冻结）。 */
 const PANEL_MAX_ENTRIES = 50;
@@ -1083,6 +1090,8 @@ export function apply(ctx, rawConfig) {
     const known = (spaceInfo.spaces ?? []).map((sp) => sp.id);
     if (!known.includes(id)) return { ok: false, reason: `没有这个分区：${id}` };
     if (id !== activeSpaceId) {
+      const prevId = activeSpaceId;
+      const prevDir = dataDir;
       activeSpaceId = id;
       dataDir = spaceDirOf(libraryRoot, id);
       try {
@@ -1090,8 +1099,14 @@ export function apply(ctx, rawConfig) {
         const reg = JSON.parse(readFileSync(regPath, 'utf8'));
         reg.active = id;
         writeFileSync(regPath, `${JSON.stringify(reg, null, 2)}\n`, 'utf8');
-      } catch {
-        // 落不了盘也不影响这次运行
+      } catch (err) {
+        /* 2026-10-28 修：原来落不了盘也照样回 ok —— 面板显示切过去了，重启又弹回原分区，
+           全程一声不响。现在把内存状态回滚，并把原因交给面板（接口那边已经会回 400）。 */
+        activeSpaceId = prevId;
+        dataDir = prevDir;
+        const why = err instanceof Error ? err.message : String(err);
+        warn(`切分区没落盘（已回滚到「${prevId}」）：${why}`);
+        return { ok: false, id, reason: `分区切不过去：注册表写不进磁盘（${why}），已保持原分区` };
       }
       invalidateAllRenders();
     }
@@ -1806,11 +1821,16 @@ export function apply(ctx, rawConfig) {
         abort.signal.addEventListener('abort', onPluginAbort, { once: true });
         const timer = setTimeout(() => {
           warn('后台固化超时，这次记忆放弃（宁可漏记，不要挂住进程）');
-          jobAbort.abort();
+          // 2026-10-28：带上原因，下游才分得清「超时」和「插件卸载」——
+          // 超时要记一次失败（面板的连败告警靠它），卸载不算。
+          jobAbort.abort('timeout');
         }, Math.max(1000, Number(config.jobTimeoutMs) || 60000));
         try {
           await consolidate(job.sessionId, job.agent, jobAbort.signal);
         } catch (err) {
+          // 2026-10-28：异常也要进账。落盘失败（store.save 现在会抛）走的就是这里，
+          // 原来只是一句 warn，面板和 memory_stats 都还说「一切正常」。
+          if (!abort.signal.aborted) noteAttempt('exception');
           warn(`固化失败：${err instanceof Error ? err.message : String(err)}`);
         } finally {
           clearTimeout(timer);
@@ -1946,7 +1966,7 @@ export function apply(ctx, rawConfig) {
    * high，后台固化也会跟着疯狂思考，maxTokens 全烧在推理上，正文一个字都没有。
    * 症状极有迷惑性：请求正常、chunk 正常、无报错、就是什么都不记。
    */
-  function makeStream({ llm, provider, model, signal }) {
+  function makeStream({ llm, provider, model, signal, dropEffort = false }) {
     const effort = typeof config.reasoningEffort === 'string' ? config.reasoningEffort.trim() : '';
     return (override = {}) => {
       const opts = {
@@ -1957,7 +1977,17 @@ export function apply(ctx, rawConfig) {
         signal,
         ...override,
       };
-      if (effort !== '') opts.reasoningEffort = effort;
+      /* 2026-10-28 修：原来这里无条件把配置里的档位塞回去 ——
+         于是「provider 不认档位 → 退回不指定再试一次」那条重试拿到的请求和第一次一模一样，
+         必然在同一个错上再撞一次，等于死码。
+         现在两条路听调用方的：① 显式 dropEffort ② override 里自带 reasoningEffort 键
+         （值写 null 表示「这一轮就是要不指定」，会把字段整个去掉）。 */
+      const callerSaid = Object.prototype.hasOwnProperty.call(override, 'reasoningEffort');
+      if (callerSaid && override.reasoningEffort === null) {
+        delete opts.reasoningEffort;
+      } else if (effort !== '' && !dropEffort && !callerSaid) {
+        opts.reasoningEffort = effort;
+      }
       return llm.stream(opts);
     };
   }
@@ -2061,7 +2091,10 @@ export function apply(ctx, rawConfig) {
         // 该退回「不指定」，而不是让整个记忆功能瘫痪。
         if (/REASONING_EFFORT/i.test(msg)) {
           warn('provider 不接受思考档位，退回不指定重试一次');
-          return collectStream(payload(makeStream({ llm: route.llm, provider: route.provider, model: route.model, signal })));
+          // 2026-10-28：dropEffort 这次是真的生效了（以前会被 makeStream 覆盖回去，白重试）
+          return collectStream(
+            payload(makeStream({ llm: route.llm, provider: route.provider, model: route.model, signal, dropEffort: true })),
+          );
         }
         throw err;
       }
@@ -2073,6 +2106,10 @@ export function apply(ctx, rawConfig) {
       run = await callOnce(usedTokens);
     } catch (err) {
       if (signal?.aborted) {
+        /* 2026-10-28 修：超时原来只 warn 就 return —— 不 noteAttempt、不计连败。
+           结果就是模型一挂死，面板永远「还没固化过」，连败告警永不触发。
+           现在超时算一次失败；插件卸载 / 宿主关闭引起的 abort 不算（reason 不是 timeout）。 */
+        if (signal.reason === 'timeout') return noteAttempt('timeout');
         warn('固化被中止，这次不记');
         return;
       }
@@ -2096,7 +2133,12 @@ export function apply(ctx, rawConfig) {
             usedTokens = bigger;
           }
         } catch (err) {
-          if (!signal?.aborted) throw err;
+          // 2026-10-28：重试时被超时掐断，同样要进账，不能悄悄算了
+          if (signal?.aborted) {
+            if (signal.reason === 'timeout') return noteAttempt('timeout');
+          } else {
+            throw err;
+          }
         }
       }
     }
@@ -2350,7 +2392,17 @@ export function apply(ctx, rawConfig) {
       await store.archive(group, 'compressed');
       const ids = new Set(group.map((e) => e?.id).filter((id) => typeof id === 'string'));
       for (const id of ids) store.remove(id);
-      store.add({ ...entry, zone: nextZone(zone) });
+      const placed = store.add({ ...entry, zone: nextZone(zone) });
+      if (placed === null) {
+        /* 2026-10-28 修：原来不看 add 的返回值。add 返回 null（条目没通过 normalizeEntry）
+           时，这一组原文**已经被上面 remove 掉了** —— 压缩变成净删，却还 return true 报成功。
+           现在把原条目原样放回去（_archive 里也有一份），并把这次压缩判为失败。 */
+        for (const e of group) {
+          if (e !== null && typeof e === 'object' && typeof e.id === 'string') store.add(e);
+        }
+        warn(`压缩后的条目没通过校验，已把原 ${group.length} 条放回（这次压缩作废）`);
+        return false;
+      }
       return true;
     } catch (err) {
       warn(`压缩落位失败：${err instanceof Error ? err.message : String(err)}`);
@@ -2855,6 +2907,8 @@ export function apply(ctx, rawConfig) {
   async function forgetEntry(id) {
     await loadPromise;
     if (typeof id !== 'string' || id === '') return false;
+    // 先留一份原对象：落盘失败时要原样放回去（save 现在会抛错，不再假装成功）
+    const target = store.all().find((e) => e !== null && e.id === id) ?? null;
     let removed = false;
     try {
       removed = store.remove(id);
@@ -2862,7 +2916,17 @@ export function apply(ctx, rawConfig) {
       removed = false;
     }
     if (!removed) return false;
-    await store.save();
+    try {
+      await store.save();
+    } catch (err) {
+      /* 2026-10-28 修：save 现在会抛（盘满 / 只读 / 被占用）。
+         删只发生在内存里、盘上没删 —— 重启就会复活。所以撤回内存删除、报失败，
+         别让面板显示「已忘掉」而磁盘上那条还在。 */
+      if (target !== null) store.add(target);
+      const why = err instanceof Error ? err.message : String(err);
+      warn(`忘掉那条没写进磁盘，已撤回：${why}`);
+      return false;
+    }
     invalidateAllRenders();
     log(`忘掉一条，剩 ${store.all().length} 条`);
     return true;
@@ -2916,7 +2980,13 @@ export function apply(ctx, rawConfig) {
     } catch (err) {
       warn(`按总量回收失败：${err instanceof Error ? err.message : String(err)}`);
     }
-    await store.save();
+    try {
+      await store.save();
+    } catch (err) {
+      // 2026-10-28：写盘失败就整次报错（面板 500 / 后台计入 exception），
+      // 不能像原来那样"内存里收割完了、盘上还是老样子"却回一个 ok。
+      throw new Error(`收割结果写不进磁盘：${err instanceof Error ? err.message : String(err)}`);
+    }
     invalidateAllRenders();
     return { plan };
   }
@@ -2936,7 +3006,12 @@ export function apply(ctx, rawConfig) {
     } catch (err) {
       warn(`按总量回收失败：${err instanceof Error ? err.message : String(err)}`);
     }
-    await store.save();
+    try {
+      await store.save();
+    } catch (err) {
+      // 2026-10-28：同上 —— 压缩结果没落盘就报错，别回一个假的 ok
+      throw new Error(`压缩结果写不进磁盘：${err instanceof Error ? err.message : String(err)}`);
+    }
     invalidateAllRenders();
     return results;
   }
@@ -3236,13 +3311,13 @@ export function apply(ctx, rawConfig) {
       mirror: mirrorPanelState(),
       // 记忆库自检的进度（面板上「上次自检」那一行）
       dedup: dedupPanelState(),
-      // bot 记忆专区：装了 dsh-qq-bot 时这个开关是**锁死**的，配置写 false 也不算。
+      // bot 记忆专区：**一个键给全**。
+      // 2026-10-28 修：这里原来写了两个同名 `botSpace` 键，后一个把前一个整个盖掉 ——
+      // enabled / configured / locked / reason 客户端永远收不到，面板只能显示半截状态。
+      // 现在合并：绑定信息来自独立文件，开关 / 原因来自配置。
       botSpace: {
-        enabled: botSpaceEnabledEffective(),
+        ...botSpacePanel(),
         configured: config.botSpaceEnabled === true,
-        locked: botPluginPresent(),
-        spaceId: typeof config.botSpaceId === 'string' ? config.botSpaceId : '',
-        uins: botUins(),
         reason: (() => {
           if (!botPluginPresent()) return '';
           const sp = typeof config.botSpaceId === 'string' ? config.botSpaceId.trim() : '';
@@ -3252,8 +3327,6 @@ export function apply(ctx, rawConfig) {
           return '检测到 dsh-qq-bot 正在运行：这个开关被锁定为开启，不允许关闭。请先卸载 Qbot 插件，再回来关它。';
         })(),
       },
-      // bot 记忆专区：独立文件里钉死的绑定（不受当前分区 / 面板覆盖设置影响）
-      botSpace: botSpacePanel(),
       // 分区体检：谁炸了、镜像里有没有备份
       health: partitionHealth(),
       // 固化日志（面板上那个小框）。**只给形状**：时间 / 结果 / 条数 / 链路，

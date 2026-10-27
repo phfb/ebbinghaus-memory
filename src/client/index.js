@@ -1718,6 +1718,9 @@ window.__ModuleLoader__.load({
           'parse-failed': '解析失败',
           'nothing-worth': '判断不值得记',
           'no-valid': '校验没过',
+          // 2026-10-28 新增的两种失败：不补这两行，面板会直接显示英文原码
+          timeout: '超时挂死（模型没回应）',
+          exception: '异常（多半是写盘失败）',
         }[o] ?? String(o));
       const hhmm = (ms) => {
         const dt = new Date(Number(ms) || 0);
