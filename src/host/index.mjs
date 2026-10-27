@@ -1658,7 +1658,7 @@ export function apply(ctx, rawConfig) {
     lines.push(`来源白名单：${userSourceKinds().join(',')}`);
     const botInfo = botSpacePanel();
     lines.push(
-      `bot 记忆专区：${botSpaceEnabledEffective() ? '开' : '关'}${botPluginPresent() ? '（检测到 dsh-qq-bot，已锁定为开启，不允许关闭）' : ''} · 分区 ${botInfo.spaceLabel || '未指定'}${botInfo.locked ? '（已钉死）' : ''} · 号 ${botUins().join(',') || '全部'} · 见过的号 ${botInfo.seenUins.map((x) => x.uin).join(',') || '无'}`,
+      `bot 记忆专区：${botSpaceEnabledEffective() ? '开' : '关'}${botPluginPresent() ? '（检测到 dsh-qq-bot，已锁定为开启，不允许关闭）' : ''} · 分区 ${botInfo.spaceLabel || '未指定'}${botInfo.locked ? '（已固定，不允许改）' : ''} · 号 ${botUins().join(',') || '全部'} · 见过的号 ${botInfo.seenUins.map((x) => x.uin).join(',') || '无'}`,
     );
     lines.push(
       `固化节奏：每 ${config.writeEveryTurns} 轮 · 最小间隔 ${config.minIntervalSeconds}s · maxTokens ${config.maxTokens} · 思考档 ${config.reasoningEffort || '默认'}`,
@@ -3425,7 +3425,7 @@ export function apply(ctx, rawConfig) {
                 const label = lockedName ? `${lockedName}（${lockedId}）` : lockedId;
                 return reply(res, 409, {
                   ok: false,
-                  error: `已经钉死在「${label}」，不允许更改。真要换，得手动删掉 bot-space.json。`,
+                  error: `已经存到「${label}」，不允许更改。真要换，得手动删掉 bot-space.json。`,
                 });
               }
               botSpace.spaceId = spaceId;
