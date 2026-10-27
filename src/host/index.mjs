@@ -2547,15 +2547,34 @@ export function apply(ctx, rawConfig) {
         if (!existsSync(srcDir)) continue;
         const mir = path.join(root, sp.id);
         mkdirSync(mir, { recursive: true });
-        try {
-          rmSync(path.join(mir, 'library'), { recursive: true, force: true });
-        } catch {
-          // 删不掉就覆盖，别因此整个同步失败
-        }
         // dshHome / extraPaths 传空：那两样只在下面按「激活分区」写一次，
         // 否则 N 个分区就复制 N 份图片，白占空间
         const plan = planMirror({ dataDir: srcDir, dshHome: '', extraPaths: [] });
-        const got = copyPlan(plan, mir);
+        /* 2026-10-28 修：原来是**无条件** rm 掉镜像里的 library 再复制 ——
+           本地这个分区一旦被清空（换分区、误删、初始化竞态），下一次同步就把唯一的好备份盖成空的，
+           而且一声不响。现在两道保险：
+             ① 源里一条都没有 → 直接跳过，旧备份原样留着；
+             ② 先把旧 library 改名成 library.old，复制成功才删它；复制失败就还回去。 */
+        if (plan.items.length === 0) {
+          warnings.push(`${sp.id}：源是空的，这次跳过（没动旧备份）`);
+          continue;
+        }
+        const mirLib = path.join(mir, 'library');
+        const oldLib = path.join(mir, 'library.old');
+        rmSync(oldLib, { recursive: true, force: true });
+        const hadOld = existsSync(mirLib);
+        if (hadOld) renameSync(mirLib, oldLib);
+        let got;
+        try {
+          got = copyPlan(plan, mir);
+        } catch (copyErr) {
+          if (hadOld) {
+            rmSync(mirLib, { recursive: true, force: true });
+            renameSync(oldLib, mirLib);
+          }
+          throw copyErr;
+        }
+        if (hadOld) rmSync(oldLib, { recursive: true, force: true });
         totalFiles += got.files.length;
         totalBytes += got.bytes;
 

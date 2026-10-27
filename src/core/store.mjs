@@ -86,8 +86,20 @@ async function writeAtomic(file, text) {
   } catch (err) {
     // Windows: 目标存在时 rename 可能失败（EPERM/EEXIST）。退一步：删了再改名。
     if (err && (err.code === 'EPERM' || err.code === 'EEXIST' || err.code === 'EACCES')) {
-      await fsp.rm(file, { force: true });
-      await fsp.rename(tmp, file);
+      /* 2026-10-28 修：原来直接 rm 目标再 rename —— 中间崩一下，这个分区就只剩 tmp 那份、
+         目标没了，等于丢唯一副本。改成「旧文件先挪成 .old → 换新的进去 → 再删 .old」，
+         任何时刻磁盘上都有一份完整的。 */
+      const backup = `${file}.old`
+      await fsp.rm(backup, { force: true }).catch(() => {})
+      await fsp.rename(file, backup)
+      try {
+        await fsp.rename(tmp, file)
+      } catch (swapErr) {
+        // 换不进去就把旧的还回来，别让这个分区裸着
+        await fsp.rename(backup, file).catch(() => {})
+        throw swapErr
+      }
+      await fsp.rm(backup, { force: true }).catch(() => {})
     } else {
       await fsp.rm(tmp, { force: true }).catch(() => {});
       throw err;
@@ -285,8 +297,15 @@ export function createStore(opts) {
         let text;
         try {
           text = await fsp.readFile(path.join(dir, zoneFile(zone)), 'utf8');
-        } catch {
-          continue; // 文件还没有 / 读不了：跳过，不当作错误
+        } catch (err) {
+          // 文件还没写过 → 正常，跳过。
+          if (err && err.code === 'ENOENT') continue;
+          /* 2026-10-28 修：读失败（权限 / 半截 / 被占用）以前静默 continue，
+             紧接着 save() 又整份重写这个分区 —— 外面刚导入的条目就被抹掉了，一声不响。
+             现在直接抛：这一次落盘整体中止，宁可这次不写，也不能把别人的数据盖掉。 */
+          throw new Error(
+            `合并外部写入时读不出 ${zoneFile(zone)}：${err instanceof Error ? err.message : String(err)}`,
+          );
         }
         const { entries } = parseJsonl(text);
         let added = 0;
@@ -437,8 +456,7 @@ export function createStore(opts) {
      * @returns {Promise<void>}
      */
     save() {
-      writeChain = writeChain
-        .then(async () => {
+      const run = writeChain.then(async () => {
           await fsp.mkdir(dir, { recursive: true });
           // 先合并外部写入，再整份重写 —— 顺序不能反
           await this.mergeFromDisk();
@@ -450,11 +468,16 @@ export function createStore(opts) {
             path.join(dir, META_FILE),
             `${JSON.stringify(meta, null, 2)}\n`,
           );
-        })
-        .catch((err) => {
-          warn(`记忆落盘失败：${err instanceof Error ? err.message : String(err)}`);
         });
-      return writeChain;
+      // 队列本身必须继续能用：某一次写失败不能把后面所有写都卡死，所以这里吞掉
+      writeChain = run.then(() => undefined, () => undefined);
+      /* 2026-10-28 修：原来这条链的 .catch 只 warn 就吞，promise 永远 resolve ——
+         上层那句「固化完成：入库 N 条」和面板上的 ok 全是假的（盘满时内存有、盘上没有）。
+         现在把错误抛给调用方，同时队列照旧继续。 */
+      return run.catch((err) => {
+        warn(`记忆落盘失败：${err instanceof Error ? err.message : String(err)}`);
+        throw err instanceof Error ? err : new Error(String(err));
+      });
     },
 
     /** 等所有挂起的写盘落定（导出前要用）。 */
