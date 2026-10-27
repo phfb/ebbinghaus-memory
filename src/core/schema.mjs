@@ -55,6 +55,26 @@ export function clamp01(n) {
   return Math.min(1, Math.max(0, v));
 }
 
+/**
+ * 把模型给的 weight 折回 0~1。**只折算「明显不是 0~1 量纲」的值，其余原样返回。**
+ *
+ * 为什么需要：固化提示词要求 weight 用 0.1/0.5/0.8/0.95，但实际上模型
+ * （deepseek-v4.1-flash、glm-5.3-flash 都观察到过）会按 10 分制给 3、8 这种值。
+ * 3 直接 clamp01 会变成 1.0 —— 于是 `initialZoneFor` 判它 ≥0.92，整批记忆
+ * 空降永久区，权重和分区一起失真。
+ *
+ * 保守起见只在 >1 时按 /10 折算；正常写法（0~1）一个字节都不动，
+ * 非数字也原样返回，让调用方自己决定兜底值。
+ *
+ * @param {unknown} n
+ * @returns {number}
+ */
+export function normalizeWeight(n) {
+  const v = Number(n);
+  if (Number.isFinite(v) && v > 1) return clamp01(v / 10);
+  return v;
+}
+
 function two(n) {
   return String(n).padStart(2, '0');
 }
@@ -196,8 +216,14 @@ export function normalizeEntry(raw, opts) {
   // 未来时间一律拉回现在（时钟漂移不该让记忆永远不到期）
   if (ts > now + 60000) ts = now;
 
-  const title = cleanText(raw.title ?? raw.text ?? '', MAX_TITLE);
-  const detail = cleanText(raw.detail ?? raw.text ?? '', MAX_DETAIL);
+  // 正文兜底：模型不一定会用 title/detail 这两个键名。实测 unlimit 代理下的
+  // deepseek-v4.1-flash 和 glm-5.3-flash 都习惯输出 {"type":"fact","content":"..."}，
+  // content 不在原来那两个键里 → 被判成「空条目」直接丢掉，整批 added=0，
+  // 而这条路径只在 debugLog 打开时才可见（症状就是「用了半天一条没记上」）。
+  // 正文从哪个键都能捞，是这里唯一该硬的地方；至于它叫什么名字，不该决定记忆的生死。
+  const body = raw.content ?? raw.summary ?? raw.memo ?? raw.text;
+  const title = cleanText(raw.title ?? body ?? '', MAX_TITLE);
+  const detail = cleanText(raw.detail ?? body ?? '', MAX_DETAIL);
   if (title === '' && detail === '') return null;
 
   const keywords = normalizeKeywords(raw.keywords ?? raw.tags);
@@ -220,6 +246,8 @@ export function normalizeEntry(raw, opts) {
   const taken = opts?.taken instanceof Set ? opts.taken : new Set(Array.isArray(opts?.taken) ? opts.taken : []);
   const id = typeof raw.id === 'string' && raw.id !== '' ? raw.id : makeId(ts, taken);
 
+  // 注意：这里的 clamp01 是**契约**（SPEC：越界一律夹到 1），不要在这里做量纲折算。
+  // 模型给的 10 分制 weight 由调用方（host 的 ingest）先用 normalizeWeight 折好再传进来。
   const weight = clamp01(raw.weight ?? 0.4);
 
   return {

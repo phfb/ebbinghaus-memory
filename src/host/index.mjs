@@ -77,7 +77,8 @@ import {
   spaceDirOf,
   verifyMigration,
 } from '../core/spaces.mjs';
-import { ZONE_LABEL, ZONES, normalizeEntry } from '../core/schema.mjs';
+import { ZONE_LABEL, ZONES, normalizeEntry, normalizeWeight } from '../core/schema.mjs';
+import { canonicalizeEntry, extractJsonArray } from '../core/compat.mjs';
 import { expiryOverview, fullStamp, relativeStamp, stampFor } from '../core/time.mjs';
 import { harvest, initialZoneFor, isOverCapacity, digestDropped } from '../core/zones.mjs';
 import { compressWithModel, fallbackMerge, pickCompressGroup } from '../core/compress.mjs';
@@ -126,6 +127,15 @@ const SECTION_ORDER = 110;
 const MAX_TRANSCRIPT = 40;
 /** 固化送给模型的最近消息条数。 */
 const CONSOLIDATE_TAIL = 14;
+/**
+ * 预算自适应重试的天花板。
+ *
+ * 2026-10-27：模型（尤其走第三方代理的）会**强制思考**，一次固化光 reasoning
+ * 就吃 1200~2000 token。config.maxTokens 配小了，正文回来是空字符串，插件按
+ * 「解析失败」整批丢弃。所以正文空 / 被截断时把预算翻倍重试一次，最高到 8000
+ * （config 里 maxTokens 的上限，再高就不该由固化一个人占着了）。
+ */
+const MAX_CONSOLIDATE_TOKENS = 8000;
 /** 单条消息送进模型前截断的字符数（防一次长贴图把 maxTokens 吃光）。 */
 const MAX_MESSAGE_CHARS = 1200;
 /** 面板每区一次最多回多少条（§ lead 冻结）。 */
@@ -498,6 +508,24 @@ export function parseConsolidationOutput(text) {
   if (!Array.isArray(parsed)) return null;
   // 数组里非对象的成员直接剔除；一条都不剩也算"没内容"，但仍是合法空批
   return parsed.filter((x) => x !== null && typeof x === 'object' && !Array.isArray(x));
+}
+
+/**
+ * 宽松版解析：**严格版失败之后才用**。
+ *
+ * 严格版只认「整段就是一个 JSON 数组」，这是 SPEC 的口径，也是我们希望的形状。
+ * 但实际跑起来模型经常交不出这个形状：前后带一句解释、包在 {"memories":[…]} 里、
+ * 键名用 content 而不是 detail、zone 用语义词、时间写成本地字符串……
+ * 全按严格版处理的结果是**一条都记不上，而且只有一句「不是合法 JSON」**。
+ *
+ * 所以这里接第二道：从噪声里抠数组、把键名对齐（见 core/compat.mjs）。
+ * 它不编内容、不补事实，只是换个地方读同一句话。
+ *
+ * @param {unknown} text
+ * @returns {object[]|null}
+ */
+export function parseConsolidationOutputLenient(text) {
+  return extractJsonArray(text);
 }
 
 /** 三个分区里的下一个区（压缩后的落点）。 */
@@ -1424,7 +1452,13 @@ export function apply(ctx, rawConfig) {
       '对话：',
       lines,
       '',
-      '只输出 JSON 数组。',
+      // 字段名必须在 user 消息末尾再喊一遍。system 里那段「输出格式」实测压不住
+      // 模型：2026-10-27 对照实验里，同一个 system，flash / glm 都吐出
+      // {"type":"fact","content":"..."}，0 条能过 normalizeEntry；末尾补这一句
+      // 之后 7 条全部按 ts/weight/zone/title/detail/keywords 输出。system 是
+      // 冻结的（改了容易让模型开口解释），所以这一层只能加在这里。
+      '只输出 JSON 数组。数组里每个对象的键只能是 ts、weight、zone、title、detail、keywords；不得出现 content、type、text、session、time 等其它键。',
+      '正文放 detail（≤200 字），一句话概括放 title（≤40 字）；weight 用 0~1 的小数（如 0.5，别用 3、8 这种满分制）；zone 只能是 short、long、permanent。',
     ].join('\n');
   }
 
@@ -1462,50 +1496,72 @@ export function apply(ctx, rawConfig) {
 
     const now = Date.now();
     const started = Date.now();
-    const stream = makeStream({ llm: route.llm, provider: route.provider, model: route.model, signal });
 
     log(`固化开始：${transcript.length} 条消息 → ${route.provider}/${route.model}`);
 
-    let run;
-    try {
-      run = await collectStream(
-        stream({
-          system: CONSOLIDATE_SYSTEM,
-          messages: [
-            { role: 'user', content: [{ type: 'text', text: buildConsolidateUser({ transcript, now, sessionId }) }] },
-          ],
-          maxTokens: config.maxTokens,
-          temperature: 0.2,
-          signal,
-        }),
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // 有的 provider 不认这个档位会直接抛 UNSUPPORTED_REASONING_EFFORT。
-      // 该退回「不指定」，而不是让整个记忆功能瘫痪。
-      if (/REASONING_EFFORT/i.test(msg)) {
-        warn('provider 不接受思考档位，退回不指定重试一次');
-        const retryStream = makeStream({ llm: route.llm, provider: route.provider, model: route.model, signal });
-        run = await collectStream(
-          retryStream({
-            system: CONSOLIDATE_SYSTEM,
-            messages: [
-              { role: 'user', content: [{ type: 'text', text: buildConsolidateUser({ transcript, now, sessionId }) }] },
-            ],
-            maxTokens: config.maxTokens,
-            temperature: 0.2,
-            signal,
-          }),
-        );
-      } else if (signal?.aborted) {
-        warn('固化被中止，这次不记');
-        return;
-      } else {
+    /**
+     * 单次模型调用。`reasoningEffort` 不被 provider 接受时退回「不指定」再试一次。
+     * @param {number} maxTokens
+     */
+    async function callOnce(maxTokens) {
+      const payload = (fn) => fn({
+        system: CONSOLIDATE_SYSTEM,
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: buildConsolidateUser({ transcript, now, sessionId }) }] },
+        ],
+        maxTokens,
+        temperature: 0.2,
+        signal,
+      });
+      try {
+        return await collectStream(payload(makeStream({ llm: route.llm, provider: route.provider, model: route.model, signal })));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // 有的 provider 不认这个档位会直接抛 UNSUPPORTED_REASONING_EFFORT。
+        // 该退回「不指定」，而不是让整个记忆功能瘫痪。
+        if (/REASONING_EFFORT/i.test(msg)) {
+          warn('provider 不接受思考档位，退回不指定重试一次');
+          return collectStream(payload(makeStream({ llm: route.llm, provider: route.provider, model: route.model, signal })));
+        }
         throw err;
       }
     }
 
-    log(`模型返回 ${run.chunks} 个 chunk / ${run.text.length} 字 / ${Date.now() - started}ms`);
+    let usedTokens = config.maxTokens;
+    let run;
+    try {
+      run = await callOnce(usedTokens);
+    } catch (err) {
+      if (signal?.aborted) {
+        warn('固化被中止，这次不记');
+        return;
+      }
+      throw err;
+    }
+
+    // 预算不足才重试：截断，或者正文一个字都没有（思考把预算吃光了）。
+    // 调用本身出错（error / aborted）不重试 —— 那只会在同一个错上多烧一次钱。
+    const budgetShort =
+      run.finish?.kind !== 'error' &&
+      run.finish?.kind !== 'aborted' &&
+      (run.finish?.kind === 'max-tokens' || run.text.trim() === '');
+    if (budgetShort && !signal?.aborted) {
+      const bigger = Math.min(MAX_CONSOLIDATE_TOKENS, Math.max(usedTokens * 2, 2000));
+      if (bigger > usedTokens) {
+        log(`正文空或被截断（预算 ${usedTokens}），翻到 ${bigger} 重试一次`);
+        try {
+          const retry = await callOnce(bigger);
+          if (retry !== null) {
+            run = retry;
+            usedTokens = bigger;
+          }
+        } catch (err) {
+          if (!signal?.aborted) throw err;
+        }
+      }
+    }
+
+    log(`模型返回 ${run.chunks} 个 chunk / ${run.text.length} 字 / ${Date.now() - started}ms（预算 ${usedTokens}）`);
 
     // ⚠️ 三种 finish 一律**不写盘**：宁可漏记，也不要坏档。
     if (run.finish?.kind === 'error' || run.finish?.kind === 'aborted') {
@@ -1513,15 +1569,29 @@ export function apply(ctx, rawConfig) {
       return noteAttempt('model-error');
     }
     if (run.finish?.kind === 'max-tokens') {
-      warn('输出被 maxTokens 截断，这次不记（宁可漏记，不要坏档）');
+      warn(`输出被 maxTokens 截断（预算已升到 ${usedTokens}），这次不记（宁可漏记，不要坏档）`);
       return noteAttempt('truncated');
     }
 
-    const parsed = parseConsolidationOutput(run.text);
+    // 空正文单独走一条路。它和「输出不是合法 JSON」在诊断上完全是两回事：
+    // 2026-10-27 那次排查就卡在这儿 —— 模型把 maxTokens 全烧在思考上、content
+    // 回来是空串，却统一报成「不是合法 JSON」，看着像模型乱说话，实际一个字没吐。
+    if (run.text.trim() === '') {
+      warn(`模型正文为空（${run.chunks} 个 chunk 全是思考/空串），这次不记；先调大 maxTokens`);
+      return noteAttempt('empty');
+    }
+
+    // 严格解析是 SPEC 口径，先走它；失败了再走宽松层（从噪声里抠数组、对齐键名）。
+    // 两层都不行的才叫「真的没东西」，这时整批丢弃 —— 半成品写进档案比漏记危险得多。
+    let parsed = parseConsolidationOutput(run.text);
     if (parsed === null) {
-      // 解析失败**整批丢弃** —— 半成品写进档案比漏记危险得多
-      warn('固化输出解析失败，整批丢弃');
-      return noteAttempt('parse-failed');
+      const lenient = parseConsolidationOutputLenient(run.text);
+      if (lenient === null) {
+        warn('固化输出解析失败（严格 + 宽松都没抠出数组），整批丢弃');
+        return noteAttempt('parse-failed');
+      }
+      log(`严格解析没过，宽松层抠出 ${lenient.length} 条`);
+      parsed = lenient;
     }
     if (parsed.length === 0) {
       log('模型判断这段不值得记，跳过');
@@ -1554,23 +1624,27 @@ export function apply(ctx, rawConfig) {
     const taken = new Set(store.all().map((e) => e.id));
     let added = 0;
 
-    for (const raw of rawList) {
+    for (const incoming of rawList) {
       try {
-        const weight = Number(raw?.weight);
+        // 容错层：模型可能把正文塞在 content、把分区写成 semantic、把时间写成本地
+        // 字符串。先对齐成标准键名再往下走。幂等 —— 本来就是标准形状的条目一个
+        // 字节都不动；只对齐「叫什么名字」，不编任何内容。
+        const raw = canonicalizeEntry(incoming);
+        // 模型给的 10 分制 weight（3、8 这种）在这里折回 0~1，再往下走。
+        // normalizeEntry 里的 clamp01 是契约（越界夹到 1），不负责折算 —— 3 直接
+        // 夹成 1.0 会让整批记忆空降永久区，权重和分区一起失真。
+        const weight = normalizeWeight(raw?.weight);
+        const safeWeight = Number.isFinite(weight) ? weight : 0.4;
         let zone = 'short';
         try {
           // 第三个参数是模型自己给的分区建议（用户要求「由 AI 判断该进哪一层」）。
           // 它没给建议时，initialZoneFor 只有极高权重才会空降永久区。
-          zone = initialZoneFor(
-            Number.isFinite(weight) ? weight : 0.4,
-            config,
-            raw?.zone,
-          );
+          zone = initialZoneFor(safeWeight, config, raw?.zone);
         } catch {
           zone = 'short';
         }
         const entry = normalizeEntry(
-          { ...raw, source: raw?.source ?? 'chat' },
+          { ...raw, weight: safeWeight, source: raw?.source ?? 'chat' },
           { zone, now: ctxInfo.now, session: ctxInfo.sessionId, source: 'chat', taken },
         );
         if (entry === null) continue;
@@ -2283,7 +2357,8 @@ export function apply(ctx, rawConfig) {
         'no-model': '没有可用模型，跳过',
         'model-error': '模型调用出错，整批丢弃',
         truncated: '输出被截断，整批丢弃（调大 maxTokens）',
-        'parse-failed': '模型输出不是合法 JSON，整批丢弃',
+        empty: '模型正文是空的（思考吃光了 maxTokens），整批丢弃',
+        'parse-failed': '模型输出的正文不是合法 JSON，整批丢弃',
         'nothing-worth': '模型判断这段不值得记',
         'no-valid': '条目没通过校验，一条都没写',
       }[lastAttempt.outcome] ?? lastAttempt.outcome;

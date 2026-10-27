@@ -10,6 +10,7 @@ import {
   makeId,
   normalizeEntry,
   normalizeKeywords,
+  normalizeWeight,
 } from '../src/core/schema.mjs';
 
 test('分区常量顺序即深度', () => {
@@ -107,4 +108,28 @@ test('isValidEntry 拒绝塌掉的字段', () => {
   assert.equal(isValidEntry({ ...good, ts: 'abc' }), false);
   assert.equal(isValidEntry({ ...good, zone: 'dream' }), false);
   assert.equal(isValidEntry(null), false);
+});
+
+// 2026-10-27 回归：固化模型不按 ts/title/detail 给字段，正文塞在 content 里。
+// 这条必须一直过 —— 它一旦失效，固化会静默丢满整批，只在 debugLog 里可见。
+test('normalizeEntry 认得模型用的 content 键，不当成空条目丢掉', () => {
+  const raw = { type: 'fact', content: '桌面端记忆插件的 mirror 目录指向 D:/DSH/dsh-home/ebbinghaus-mirror', ts: 1793086189781 };
+  const e = normalizeEntry(raw, { zone: 'short', now: 1793086189781 });
+  assert.notEqual(e, null);
+  assert.match(e.detail, /mirror 目录指向/);
+  assert.ok(e.title.length > 0, 'title 应从 content 派生出来');
+  assert.equal(e.ts, 1793086189781);
+});
+
+test('normalizeEntry 对 content + detail 同时存在时优先 detail', () => {
+  const e = normalizeEntry({ content: 'content 正文', detail: 'detail 正文' }, { zone: 'short' });
+  assert.equal(e.detail, 'detail 正文');
+});
+
+test('normalizeWeight 只折算超过 1 的量纲，0~1 原样不动', () => {
+  assert.equal(normalizeWeight(3), 0.3);
+  assert.equal(normalizeWeight(8), 0.8);
+  assert.equal(normalizeWeight(1), 1);
+  assert.equal(normalizeWeight(0.65), 0.65);
+  assert.ok(Number.isNaN(normalizeWeight(undefined)));
 });

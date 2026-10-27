@@ -12,6 +12,65 @@ node tools/check-patch-yaml.mjs
 
 ---
 
+## [0.7.1] - 2026-10-27
+
+### 修复：固化几乎从不入库（换个模型就废）
+
+现象：`memory_stats` 长期显示「模型输出不是合法 JSON，整批丢弃」，新记忆一条都写不进去，
+但读取和检索一切正常。实测 10-27 那天 13 小时里 8 次固化全败，期间零新增。
+
+根因是两层叠加 —— 都不是「模型坏了」，是**我们只认一种形状**：
+
+1. **正文是空的，却被报成「不是合法 JSON」。** 走第三方代理的模型
+   （unlimit/deepseek-v4.1-flash）会强制思考，一次吃掉 1200~2000 reasoning token；
+   `maxTokens` 默认 1200 被吃干净，`content` 回来是空字符串。而
+   `parseConsolidationOutput` 把「空」和「非法 JSON」合并到同一个失败分支，
+   日志上看着像模型乱说话，实际一个字没吐。
+2. **字段名对不上，条目被静默丢光。** 即使正文出来了，模型写的是
+   `{"type":"fact","content":"…","session":"…"}`，而 `normalizeEntry` 只从
+   `title`/`detail`/`text` 取正文 —— `content` 不在其中，于是每条都判成空条目，
+   `added = 0`，而这条路径只在 `debugLog` 打开时才可见。
+
+顺带两个隐藏的失真：模型按 10 分制给 `weight: 3`，`clamp01` 夹成 1.0 →
+`initialZoneFor` 判它 ≥0.92 → 整批空降永久区；以及模型把分区写成
+`semantic` / `episodic` 这类语义词，不在三区枚举里，只能退回按 weight 猜。
+
+### 修复方式（跟具体模型解耦，换谁都能接住）
+
+- **新增 `src/core/compat.mjs` 容错层**（纯函数 / 零依赖 / 13 条测试）
+  - `extractJsonArray`：从噪声里抠数组 —— 前后带解释文字、markdown 围栏、尾逗号、
+    `{"memories":[…]}` 包装、单个对象、被截断的数组，都能救回来
+  - `canonicalizeEntry`：键名对齐 —— 正文认 `content`/`body`/`description`/`summary` 等；
+    时间认 `timestamp`/`time`/`created_at`，也认秒级时间戳和本地日期串；
+    关键词认 `tags`/`labels`；分区认 `type`/`category` 并做语义词映射
+    （`semantic` → long、`episodic` → short、`preference` → permanent）
+  - 两条硬约束：**幂等**（本来就是标准形状的条目走一遍不变形）、
+    **不编内容**（抠不出正文的条目仍然丢掉，绝不填占位）
+- **固化改走「严格 → 宽松」两道解析**：SPEC 口径的严格解析先跑，失败才降级到容错层；
+  两层都不行才算「真的没东西」
+- **预算自适应重试**：正文为空、或被 `maxTokens` 截断时，预算翻倍重试一次
+  （上限 `MAX_CONSOLIDATE_TOKENS = 8000`）；调用本身出错**不重试**，免得在同一个错上多烧一次钱
+- **`normalizeWeight`**：`weight` 超过 1 时按 10 分制折回 0~1；0~1 的写法一个字节都不动
+- **固化提示词末尾补字段清单**：`CONSOLIDATE_SYSTEM` 是冻结的，改在 user 消息末尾。
+  对照实验（同一 system）：不补 → 0 条合规；补了 → 7/7 合规
+- **空正文单独一条告警**：`empty` 与 `parse-failed` 分开，
+  下次一眼能看出是「模型没吐字」还是「吐的格式坏」
+
+### 部署侧配置（不在本包内，记录在此以免忘）
+
+- `cordis.patch.yml`：`maxTokens` 1200 → 4000
+- 固化 `provider` / `model` 与聊天模型解耦，钉在 `deepseek-account/deepseek-flash`；
+  两行都删掉 = 回到跟随聊天模型
+
+### 验证
+
+- `node --test`：281 条全过（新增 compat 13 条 + schema 回归 3 条）
+- 端到端（真实模型 / 14 条对话）：
+  - 喂「不听话」的旧提示词（模型吐 `content`/`type`/`session`）→ **8/8 入库**（修复前 0/8）
+  - 当前提示词 → 8/8 入库，weight 落在 0.5~0.95，分区分布合理
+
+---
+
 ## [0.7.0] - 2026-10-26
 
 ### 新增：两个迁移 / 同步工具（`tools/`）
