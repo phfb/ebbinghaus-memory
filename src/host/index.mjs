@@ -1005,13 +1005,40 @@ export function apply(ctx, rawConfig) {
    * 一个回合可能有几十个 step（工具调用）。不缓存的话，同一个回合里
    * 会换着花样想起不同的事 —— 很出戏，而且检索冷却会白白烧掉。
    */
+  /**
+   * 记忆链路出问题时，往注入段最前面插一行告警。
+   *
+   * **为什么塞进注入段**：这个插件的故障平时只写日志、只在面板里显示，而人不会
+   * 天天去翻面板看日志 —— 结果是「记忆悄悄不写了」能拖很久才被发现（2026-10-27
+   * 那次拖了 13 小时、零新增）。写进注入段，模型每轮都能看见，也就会顺口说出来，
+   * 对方在聊天里就能收到「记忆插件出问题了」这句话，不用等他自己去查。
+   *
+   * 只报**确定有问题**的状态：手动暂停、或者连续 ≥2 次固化没写进去。
+   * 单次失败不报 —— 那可能只是「这段对话确实没什么值得记的」。
+   */
+  function withHealthNotice(body) {
+    let notice = '';
+    if (config.modelCallsPaused) {
+      notice = '【记忆插件已暂停】记忆写入的模型调用被手动暂停了，新对话不会进记忆库。';
+    } else if (consecutiveFailures >= 2) {
+      const chain = fallbackActive
+        ? `（已临时切到兜底 ${config.fallbackProvider}/${config.fallbackModel}）`
+        : '';
+      notice = `【记忆插件异常】最近连续 ${consecutiveFailures} 次记忆固化都没成功，新记忆没写进库${chain}。请在本轮回复里提醒对方一句：记忆插件出问题了，去插件页面看日志。`;
+    }
+    if (notice === '') return body;
+    return body === '' ? notice : `${notice}\n${body}`;
+  }
+
   function renderFor(agentId) {
     // 渲染要按「这个会话绑定的分区」取记忆。renderForInner 里那几十处 store.xxx
     // 全靠 opSpaceId 指路，所以这里设好再交给内层。
     const prev = opSpaceId;
     opSpaceId = spaceIdOfSession(agentId);
     try {
-      return renderForInner(agentId);
+      // 告警加在缓存**外面**：renderForInner 按轮缓存正文，故障状态却每轮都可能变，
+      // 放进缓存里就会卡在上一轮的状态上。
+      return withHealthNotice(renderForInner(agentId));
     } finally {
       opSpaceId = prev;
     }

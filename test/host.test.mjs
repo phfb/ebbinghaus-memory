@@ -1873,3 +1873,64 @@ test('固化日志记在面板数据里（只记形状，不记正文）', async
   assert.ok(!JSON.stringify(last).includes('这句正文不该出现在日志里'), '日志里不能出现对话正文');
   assert.equal(snap.consolidate.chain.fallbackActive, false);
 });
+
+/* ── 2026-10-27：链路故障要能从注入段里“喊”出来，而不是只躺在日志里 ── */
+
+test('连续固化失败后，注入段会带「记忆插件异常」告警；正常时不带', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  let bad = true;
+  const llm = makeLlm(() => (bad ? { text: '今天不想给 JSON' } : { text: modelJson([sampleItem(now - 60_000, '一条记忆')]) }));
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const agent = makeAgent('sess-health', h.sections);
+  h.emit('agent/created', { agent });
+  const svc = h.services.get('ebbinghausMemory');
+  const say = async (text) => {
+    h.emit('session/event', { id: 'sess-health' }, {
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text }] },
+    });
+    h.emit('agent/turn-stopping', { agent });
+    await svc.flush();
+  };
+
+  // 连续失败两轮
+  await say('第一轮');
+  await say('第二轮');
+  const sick = svc.renderFor('sess-health');
+  assert.match(sick, /记忆插件异常/, '连续两次没写进去，注入段必须说出来');
+  assert.match(sick, /去看日志|看日志/, '得告诉对方去哪儿查');
+
+  // 恢复正常
+  bad = false;
+  await say('第三轮');
+  const healthy = svc.renderFor('sess-health');
+  assert.doesNotMatch(healthy, /记忆插件异常/, '恢复后就不该再喊了');
+});
+
+test('手动暂停模型调用时，注入段说明「新对话不会进记忆库」', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '一条记忆')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1, modelCallsPaused: true });
+
+  const agent = makeAgent('sess-paused', h.sections);
+  h.emit('agent/created', { agent });
+  h.emit('session/event', { id: 'sess-paused' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '随便聊聊' }] },
+  });
+  h.emit('agent/turn-stopping', { agent });
+  await h.services.get('ebbinghausMemory').flush();
+
+  assert.equal(llm.calls.length, 0, '暂停时不该调模型');
+  const text = h.services.get('ebbinghausMemory').renderFor('sess-paused');
+  assert.match(text, /记忆插件已暂停/);
+});
