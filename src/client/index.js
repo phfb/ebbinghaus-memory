@@ -1315,7 +1315,7 @@ window.__ModuleLoader__.load({
               setBotNotice(String(r.error || '保存失败'));
               return;
             }
-            setBotNotice(`已钉死在「${spaceId}」，之后不允许更改`);
+            setBotNotice(`已钉死在「${r.spaceLabel || spaceId}」，之后不允许更改`);
             reload();
           })
           .catch(() => setBotNotice('保存失败'));
@@ -1791,7 +1791,7 @@ window.__ModuleLoader__.load({
             ? h(
                 'span',
                 { style: { fontSize: 11, color: C.text2 } },
-                `已钉死：${botInfo.spaceId || '?'} —— 不允许更改（要换得手动删掉库根的 bot-space.json）`,
+                `已钉死：${botInfo.spaceLabel || botInfo.spaceId || '?'} —— 不允许更改（要换得手动删掉库根的 bot-space.json）`,
               )
             : [
                 h(
@@ -1832,7 +1832,7 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { key: `hl-${row.id}`, style: { fontSize: 11, color: C.err, lineHeight: 1.9 } },
-                `⛔ ${row.name || row.id}（${row.id}）：${(row.problems || []).join('；')}`,
+                `⛔ ${row.name && row.name !== row.id ? `${row.name}（${row.id}）` : row.name || row.id}：${(row.problems || []).join('；')}`,
                 h(
                   'button',
                   {

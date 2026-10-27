@@ -847,8 +847,15 @@ export function apply(ctx, rawConfig) {
       .filter((x) => x.uin !== '')
       .sort((a, b) => b.at - a.at);
     const locked = botSpace.lockedAt > 0 && botSpace.spaceId.trim() !== '';
+    const id = botSpaceId();
+    // 「私生活（private）」这种两个都给的写法：光给 id 谁也看不懂，
+    // 光给名字又跟 spaces.json / 目录名对不上，维护时两边都要。
+    const hit = list.find((s) => s.id === id);
+    const spaceLabel = id === '' ? '' : hit && hit.name ? `${hit.name}（${id}）` : id;
     return {
-      spaceId: botSpaceId(),
+      spaceId: id,
+      spaceName: hit?.name ?? '',
+      spaceLabel,
       locked,
       lockedAt: botSpace.lockedAt,
       seenUins,
@@ -1649,8 +1656,9 @@ export function apply(ctx, rawConfig) {
     lines.push(`就绪：${ready} · 降级：${degraded} · 总条数：${store.all().length}`);
     lines.push(`当前路由：${currentRouteLabel()}${fallbackActive ? '（已切兜底）' : ''}`);
     lines.push(`来源白名单：${userSourceKinds().join(',')}`);
+    const botInfo = botSpacePanel();
     lines.push(
-      `bot 记忆专区：${botSpaceEnabledEffective() ? '开' : '关'}${botPluginPresent() ? '（检测到 dsh-qq-bot，已锁定为开启，不允许关闭）' : ''} · 分区 ${config.botSpaceId || '未指定'} · 号 ${botUins().join(',') || '全部'}`,
+      `bot 记忆专区：${botSpaceEnabledEffective() ? '开' : '关'}${botPluginPresent() ? '（检测到 dsh-qq-bot，已锁定为开启，不允许关闭）' : ''} · 分区 ${botInfo.spaceLabel || '未指定'}${botInfo.locked ? '（已钉死）' : ''} · 号 ${botUins().join(',') || '全部'} · 见过的号 ${botInfo.seenUins.map((x) => x.uin).join(',') || '无'}`,
     );
     lines.push(
       `固化节奏：每 ${config.writeEveryTurns} 轮 · 最小间隔 ${config.minIntervalSeconds}s · maxTokens ${config.maxTokens} · 思考档 ${config.reasoningEffort || '默认'}`,
@@ -3413,9 +3421,11 @@ export function apply(ctx, rawConfig) {
               }
               const lockedId = typeof botSpace.spaceId === 'string' ? botSpace.spaceId.trim() : '';
               if (botSpace.lockedAt > 0 && lockedId !== '' && lockedId !== spaceId) {
+                const lockedName = (spaceInfo.spaces ?? []).find((s) => s.id === lockedId)?.name ?? '';
+                const label = lockedName ? `${lockedName}（${lockedId}）` : lockedId;
                 return reply(res, 409, {
                   ok: false,
-                  error: `已经钉死在「${lockedId}」，不允许更改。真要换，得手动删掉 bot-space.json。`,
+                  error: `已经钉死在「${label}」，不允许更改。真要换，得手动删掉 bot-space.json。`,
                 });
               }
               botSpace.spaceId = spaceId;
