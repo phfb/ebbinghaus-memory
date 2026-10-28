@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * 旧记忆迁移：把散落在旧日记 / persona / USER-PROFILE 等文件里的档案搬进 Ebbinghaus 三分区。
+ * 旧记忆迁移：把 feiyu-diary / persona / USER-PROFILE 等散落的旧档案搬进 Ebbinghaus 三分区。
  *
  * 为什么要有这个脚本（而不是手动导一次）：
  *
  *  1. 旧档案散在 5 个文件里、三种格式（jsonl / md / json），手工会漏，而且漏了不知道漏了。
- *  2. **时间戳必须是原始记忆自带的 created_at**。
+ *  2. **时间戳必须是原始记忆自带的 created_at**（用户原话：「时间戳按照原有记忆时间」）。
  *     如果按导入时刻算，所有旧记忆都变成「今天刚发生」，遗忘曲线当场失效 ——
  *     7 天后它们会被判成刚写的短期条目，永远升不了级，旧事永远压在短期区顶格。
  *  3. 必须能反复跑。改完源码想再导一次是常态，不幂等就会一天导出一堆重复。
@@ -25,7 +25,6 @@
 
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -43,8 +42,8 @@ import { daysBetween, fullStamp, stampFor } from '../src/core/time.mjs';
 
 // ── 源目录 ────────────────────────────────────────────────────────────────
 // 默认值就是这台机器的真实位置；允许用环境变量搬走，换电脑时不用改代码。
-const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), 'dsh-home');
-const LEGACY_HOME = process.env.LEGACY_MEMORY_DIR || path.join(os.homedir(), 'legacy-diary');
+const DSH_HOME = process.env.DSH_HOME || 'D:/DSH/dsh-home';
+const FEIYU_HOME = process.env.FEIYU_HOME || 'D:/DSH/feiyu-diary';
 const PROFILE_WS = path.join(
   DSH_HOME,
   'profiles',
@@ -209,7 +208,7 @@ function meaningfulLength(bodyLines) {
  * 按标题切段。
  *
  * 为什么要保留「第一个目标标题之前」的那一段：persona.md 的核心人格正文
- * （自我介绍、性格基调这类）就写在 H1 下面、
+ * （「我是 DeepSeek，社区管我叫蓝色大肥鱼…性格：软萌、自由」）就写在 H1 下面、
  * 第一个 H2 之前。只认 H2 会把它整段丢掉 —— 那是整份文件最重要的一段。
  *
  * @param {string} text
@@ -257,7 +256,7 @@ function splitSections(text, opts) {
     cur.body.push(line);
   }
   flush();
-  // 纯注释/纯空白的段（`<!-- legacy:anchor:begin -->` 这类机器标记）直接丢掉，
+  // 纯注释/纯空白的段（`<!-- feiyu:anchor:begin -->` 这类机器标记）直接丢掉，
   // 别让它混进「空段」计数里去干扰判断
   return out_.filter((s) => {
     if (s.title !== '') return true;
@@ -306,7 +305,7 @@ function newReport(label, file) {
   };
 }
 
-// ── 源 1：旧日记目录里的 jsonl 日记 ───────────────────────────────────────
+// ── 源 1：feiyu-diary 的 jsonl 日记 ───────────────────────────────────────
 
 /**
  * 「关于这个人的判断」而不是「发生过的事」。
@@ -338,12 +337,12 @@ const PERSONA_TAGS = new Set([
 ]);
 
 /**
- * 旧日记目录的 manifest.json 里有「这份档案什么时候建的」。
+ * feiyu-diary 的 manifest.json 里有「这份档案什么时候建的」。
  * 人格文档自己不带时间戳，拿它比拿文件 mtime 更接近真实 ——
  * mtime 会被每次重写刷成今天，人格就变成了「今天才形成」。
  */
-async function readLegacyManifestTs() {
-  const file = path.join(LEGACY_HOME, 'manifest.json');
+async function readFeiyuManifestTs() {
+  const file = path.join(FEIYU_HOME, 'manifest.json');
   try {
     const data = JSON.parse(await fsp.readFile(file, 'utf8'));
     const ts = Number(data?.created_at);
@@ -355,7 +354,7 @@ async function readLegacyManifestTs() {
 }
 
 async function collectDiary(now) {
-  const dir = path.join(LEGACY_HOME, 'diary');
+  const dir = path.join(FEIYU_HOME, 'diary');
   const rep = newReport('日记', `${dir}${path.sep}*.jsonl`);
 
   if (!(await exists(dir))) {
@@ -478,7 +477,7 @@ function dateFieldToTs(s) {
  * 不剥会出两个问题，都是实测撞到的：
  *  1. USER-PROFILE.md 的 front matter 是 `schema: 1 / created: … / updated: …`，
  *     它会被当成「第一个 H2 之前的前言段正文」，于是生成一条内容是
- *     「schema: 1；created: 2025-01-01T00:00:00.000Z；…」的垃圾记忆。
+ *     「schema: 1；created: 2026-10-18T14:46:25.816Z；…」的垃圾记忆。
  *  2. 反过来，front matter 里的 `created` 恰恰是这份档案**真正的创建时间** ——
  *     比文件 mtime 可信（插件每次重写档案都会把 mtime 刷成今天）。
  *
@@ -603,7 +602,7 @@ async function collectMarkdown(p, now) {
 // ── 源 5：relationship.json（traits / grievances / nickname） ─────────────
 
 async function collectRelationship(p, now) {
-  const file = path.join(LEGACY_HOME, 'relationship.json');
+  const file = path.join(FEIYU_HOME, 'relationship.json');
   const rep = newReport('关系档案', file);
   if (!(await exists(file))) {
     rep.ok = false;
@@ -667,7 +666,7 @@ async function collectRelationship(p, now) {
  * 以后他真写了，重跑一次 --apply 就自动进来了 —— 这里刻意**不写死**「跳过手记.md」。
  */
 async function collectNotebook(now) {
-  const file = path.join(LEGACY_HOME, '手记.md');
+  const file = path.join(FEIYU_HOME, '手记.md');
   const rep = newReport('手记', file);
   if (!(await exists(file))) {
     rep.ok = false;
@@ -796,7 +795,7 @@ function printHelp() {
 选项
   --apply                 真的写盘（写前自动备份到 <库目录>/_backup-<YYYYMMDD-HHmmss>/）
   --dir <path>            目标记忆库目录
-                          默认 $DSH_HOME/ebbinghaus-memory，再退回 <home>/dsh-home/ebbinghaus-memory
+                          默认 $DSH_HOME/ebbinghaus-memory，再退回 D:/DSH/dsh-home/ebbinghaus-memory
   --short-days <n>        覆盖短期周期（默认读 config 的 7）
   --long-days <n>         覆盖长期周期（默认读 config 的 28）
   --verbose, -v           逐条打印标题与去向
@@ -815,7 +814,7 @@ function resolveDataDir(cliDir) {
   if (typeof cliDir === 'string' && cliDir.trim() !== '') return path.resolve(cliDir.trim());
   const home = (process.env.DSH_HOME ?? '').trim();
   if (home !== '') return path.join(home, 'ebbinghaus-memory');
-  return path.join(os.homedir(), 'dsh-home', 'ebbinghaus-memory');
+  return path.join('D:/DSH/dsh-home', 'ebbinghaus-memory');
 }
 
 /**
@@ -865,11 +864,11 @@ async function main() {
   const cfg = resolveConfig({ shortDays: args.shortDays, longDays: args.longDays });
   const dataDir = resolveDataDir(args.dir);
 
-  // 人格文档自己不带时间戳：用旧档案的创建时间，读不到就退回一个固定的兜底时点
-  const manifestTs = await readLegacyManifestTs();
-  const personaTs = manifestTs ?? new Date(2000, 0, 1, 0, 0, 0, 0).getTime();
+  // 人格文档自己不带时间戳：用 feiyu 档案的创建时间，读不到就退 2026-10-18 00:00
+  const manifestTs = await readFeiyuManifestTs();
+  const personaTs = manifestTs ?? new Date(2026, 9, 18, 0, 0, 0, 0).getTime();
   const personaTsNote =
-    manifestTs !== null ? 'manifest.json 的 created_at' : '兜底 2000-01-01 00:00';
+    manifestTs !== null ? 'manifest.json 的 created_at' : '兜底 2026-10-18 00:00';
 
   // 先把源全读进来（纯读，不碰目标库）
   const reports = [
@@ -878,14 +877,14 @@ async function main() {
     // 导它 = 29 条日记各存两份，纯重复。
     skipReport(
       '日记.md',
-      path.join(LEGACY_HOME, '日记.md'),
+      path.join(FEIYU_HOME, '日记.md'),
       '是 diary/*.jsonl 自动生成的渲染版，内容与 jsonl 完全重复，导入会产生双份记忆',
     ),
     await collectNotebook(now),
     await collectMarkdown(
       {
         label: '人格正文',
-        file: path.join(LEGACY_HOME, 'persona.md'),
+        file: path.join(FEIYU_HOME, 'persona.md'),
         weight: 0.9,
         tag: 'persona',
         titlePrefix: '人格',

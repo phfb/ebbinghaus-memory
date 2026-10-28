@@ -1,12 +1,14 @@
 /**
  * 人格同步：永久记忆区 → AGENT.md
  *
- * 真相源是 ebbinghaus 库永久区里那些「人格·xxx」条目，
- * AGENT.md 是它们的一份**可注入副本**（dsh-agent-md 读它）。
+ * 用户的原话：「所有人格以永久记忆区为准，你把永久记忆区的人格复制上去」。
+ *
+ * 所以真相源是 ebbinghaus 库永久区里那 6 条「人格·xxx」，
+ * `D:\DSH\dsh-home\AGENT.md` 是它们的一份**可注入副本**（dsh-agent-md 读它）。
  *
  * 这个脚本做两件事：
- *   1. 从库里读出所有「人格·」，按库里的顺序拼成 Markdown，写进 AGENT.md
- *   2. 把它们在主库里的 weight 压到 0.1，让它们**不再占注入名额**
+ *   1. 从库里读出 6 条「人格·」，按原顺序拼成 Markdown，写进 AGENT.md
+ *   2. 把这 6 条在主库里的 weight 压到 0.1，让它们**不再占注入名额**
  *      （内容已经在 AGENT.md 里注入了，再注入一遍就是同一段话讲两遍）
  *
  * 以后你改了人格（改 AGENT.md，或者往永久区里加新的人格条目），
@@ -19,23 +21,25 @@
 
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 
 import { createStore } from '../src/core/store.mjs';
 
 const APPLY = process.argv.includes('--apply');
-/** 记忆库目录。默认 ~/ebbinghaus-memory，可用 EBBINGHAUS_DIR 覆盖。 */
-const DIR = process.env.EBBINGHAUS_DIR || path.join(os.homedir(), 'ebbinghaus-memory');
-/** 要写的人格文件。默认 ~/AGENT.md，可用 AGENT_MD 覆盖。 */
-const TARGET = process.env.AGENT_MD || path.join(os.homedir(), 'AGENT.md');
+const DIR = 'D:/DSH/dsh-home/ebbinghaus-memory';
+const TARGET = 'D:/DSH/dsh-home/AGENT.md';
 
-/**
- * 永久区里哪些标题算「人格」：所有以「人格·」开头的条目。
- *
- * 不写死清单 —— 每个人的分节方式不一样，写死就只对某一份人格有效。
- * 顺序 = 库里条目的顺序，想让某一节排在前面就调库里那几条的顺序。
- */
-const PERSONA_PREFIX = '人格·';
+/** 永久区里哪些标题算「人格」。顺序就是写进 AGENT.md 的顺序。 */
+const PERSONA_TITLES = [
+  '人格·我是谁',
+  '人格·我的形象',
+  '人格·说话方式',
+  '人格·主食',
+  '人格·我的底线',
+  '人格·我承认的缺点',
+  '人格·别对我做的事',
+  '人格·他怎么叫我',
+  '人格·我自己想的',
+];
 
 /** 压到多低就不再占注入名额（loadPermanentCount 取 weight 最高的几条）。 */
 const DEMOTE_TO = 0.1;
@@ -53,11 +57,6 @@ const DEMOTE_TO = 0.1;
 function toMarkdown(title, detail) {
   const text = String(detail ?? '').replace(/\s+/g, ' ').trim();
   if (text === '') return '';
-
-  // ── 下面三条是按标题名做的排版微调，属于「锦上添花」──
-  // 标题对不上就自动跳过，正文照常按「；」切，不影响功能。
-  // 想让别人的分节名也享受同款排版，照着加一个 if 分支即可。
-  //
 
   // 「我的形象」是按「｜」分条存的（一条里常常还带「；」，比如「种族…；职业…；组织…」，
   // 按分号切会把一句话砍成三条）。`§xxx` 单独成小标题，其余成列表项。
@@ -109,11 +108,13 @@ const store = createStore({ dir: DIR, log: () => {}, warn: (m) => console.log('w
 await store.load();
 
 const all = store.all();
-const found = all
-  .filter((x) => String(x.title ?? '').startsWith(PERSONA_PREFIX))
-  .map((entry) => ({ title: entry.title, entry }));
-/** 自动发现模式下不存在"库里缺哪条"，留个空数组给下面那段统一处理。 */
+const found = [];
 const missing = [];
+for (const title of PERSONA_TITLES) {
+  const e = all.find((x) => x.title === title);
+  if (e === undefined) missing.push(title);
+  else found.push({ title, entry: e });
+}
 
 if (found.length === 0) {
   console.log('永久区里一条「人格·」都没找到，不动 AGENT.md。');
@@ -129,15 +130,15 @@ if (missing.length > 0) {
 // （dsh-agent-md 会把 <!-- --> 剥掉，省 token）。
 // 所以这里是这套人格机制唯一的「说明书」：改人格该改哪、真相源在哪、怎么同步。
 const HEADER = `<!--
-人格文件 · 由 tools/sync-persona.mjs 从永久记忆区生成
+人格文件 · 由 D:\\Ebbinghaus-memory\\tools\\sync-persona.mjs 从永久记忆区生成
 
 【怎么改人格】
 1. 最省事：DSH 设置 → 人格 → 全局人格，直接编辑保存，下一回合生效。
 2. 或者直接改本文件（Markdown，随便什么编辑器）。
-3. 改完想把「永久记忆区」也同步回这个版本 —— 反过来手动改库里那些
+3. 改完想把「永久记忆区」也同步回这个版本 —— 反过来手动改库里那 9 条
    「人格·xxx」，再跑：node tools/sync-persona.mjs --apply
 
-【真相源】记忆库 permanent.jsonl 里的那些「人格·」条目
+【真相源】D:\\DSH\\dsh-home\\ebbinghaus-memory\\permanent.jsonl 里 9 条「人格·」
           （weight 0.1，只存不注入；内容已在本文件里，注入走本文件）
 【注入源】本文件。dsh-agent-md 每回合读它，改完下一回合生效，不用重启。
 【别做的事】别在这里写双花括号的模板变量，宿主会当变量解析失败；
@@ -225,4 +226,4 @@ const perm = [...store.zones.permanent].sort(
 console.log('\n永久区前 8 条（重启后 loadPermanentCount=6 会取前 6）：');
 perm.slice(0, 8).forEach((e, i) => console.log(`  ${i + 1}. w=${e.weight}  ${String(e.title).slice(0, 40)}`));
 console.log(`\n人格真相源：永久区那 ${found.length} 条「人格·」（weight ${DEMOTE_TO}，只存不注入）`);
-console.log(`人格注入源：${TARGET}（dsh-agent-md 每回合读它）`);
+console.log('人格注入源：D:\\DSH\\dsh-home\\AGENT.md（dsh-agent-md 每回合读它）');

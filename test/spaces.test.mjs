@@ -31,7 +31,7 @@ test('分区 id：只收 ASCII 小写数字下划线短横，2~32 位', () => {
   assert.equal(isValidSpaceId('work-2'), true);
   assert.equal(isValidSpaceId('a_1'), true);
   assert.equal(isValidSpaceId('a'), false, '太短');
-  assert.equal(isValidSpaceId('个人'), false, '不许中文（它还是目录名）');
+  assert.equal(isValidSpaceId('私生活'), false, '不许中文（它还是目录名）');
   assert.equal(isValidSpaceId('-abc'), false);
   assert.equal(isValidSpaceId('A B'), false);
   assert.equal(isValidSpaceId(''), false);
@@ -39,7 +39,7 @@ test('分区 id：只收 ASCII 小写数字下划线短横，2~32 位', () => {
 });
 
 test('显示名：去换行、裁到 24 字、空的返回空串', () => {
-  assert.equal(normalizeSpaceName('  个人 '), '个人');
+  assert.equal(normalizeSpaceName('  私生活 '), '私生活');
   assert.equal(normalizeSpaceName('a\nb'), 'a b');
   assert.equal(normalizeSpaceName(''), '');
   assert.equal(normalizeSpaceName('x'.repeat(50)).length, 24);
@@ -48,8 +48,8 @@ test('显示名：去换行、裁到 24 字、空的返回空串', () => {
 test('makeSpaceId：英文名转 slug，中文名退成 space-N，撞名自动加序号', () => {
   assert.equal(makeSpaceId('Work'), 'work');
   assert.equal(makeSpaceId('my work'), 'my-work');
-  assert.equal(makeSpaceId('个人', []), 'space');
-  assert.equal(makeSpaceId('个人', ['space']), 'space-2');
+  assert.equal(makeSpaceId('私生活', []), 'space');
+  assert.equal(makeSpaceId('私生活', ['space']), 'space-2');
   assert.equal(makeSpaceId('work', ['work']), 'work-2');
 });
 
@@ -152,7 +152,7 @@ function makeLegacyDir() {
   return dir;
 }
 
-test('ensureSpaces：老库整体搬进「个人」，条数一条不少', (t) => {
+test('ensureSpaces：老库整体搬进「私生活」，条数一条不少', (t) => {
   assert.ok(ensureSpaces, 'host 要导出 __spacesTest.ensureSpaces');
   const dir = makeLegacyDir();
   t.after(() => rmSync(dir, { recursive: true, force: true }));
