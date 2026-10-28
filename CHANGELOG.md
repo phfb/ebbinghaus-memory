@@ -12,6 +12,38 @@ node tools/check-patch-yaml.mjs
 
 ---
 
+## [1.0.2] - 2026-10-28
+
+### 修复：自更新永远是 404（1.0.1 反馈里的那条）
+
+- **根因**：`createUpdater` 拿到的 `repo` 是 package.json 里 `repository.url` 的**整条网址**
+  （`git+https://github.com/phfb/ebbinghaus-memory.git`），被直接拼进
+  `https://api.github.com/repos/${repo}/...`，于是请求变成
+  `repos/https://github.com/phfb/ebbinghaus-memory/tags` → 404。
+  而面板上「报告问题」那个链接要的正是整条网址，所以不能只改 package.json。
+  现在拆成两个常量：`PLUGIN_REPO_URL`（面板用）与 `PLUGIN_REPO`（= `normalizeRepoSlug(url)`，API 用）。
+- 新增 `normalizeRepoSlug()`：认 `owner/repo`、`https://github.com/owner/repo(.git)`、
+  `git+https://…`、`git@github.com:owner/repo.git`、带 `/tree/main` 的；认不出来返回空串，
+  绝不拿半截地址去拼 API。
+- `compareVersion`：`1.0` 与 `1.0.0` 现在算相等（旧实现缺位当 `undefined`，会误判方向）。
+
+### 改进：覆盖前留证据
+
+- 安装时逐文件比字节：一样的跳过；不一样的**先备份**到 `_update/backup/<时间戳>/` 再覆盖，
+  并写 `report.json` 记下「替换了哪些 / 新增哪些 / 哪些没动」，日志给一行汇总。
+  本机手改过的补丁因此随时能捞回来（本机工作副本确实比 v1.0.1 tag 新，这条不是假想）。
+- 更新范围收窄到 package.json 的 `files` 白名单（`src` / `cordis.patch.yml` / `README.md` /
+  `SPEC.md` / `CHANGELOG.md` / `LICENSE` / `package.json`），不再把 `.github` `docs` `test`
+  `tools` `AGENTS.md` 一起盖进插件目录。
+- `state.json`：成功一次就抹掉旧的 `lastError`，不会一直挂着一条早就修好的 404。
+
+### 测试
+
+- 新增 `test/self-update.test.mjs`（8 条）：slug 归一化、版本比较、mounts `only` 白名单、
+  覆盖前备份 / 报告 / 未变跳过。1.0.1 发版时这块测试是空的，所以 bug 一路发了出去。
+
+---
+
 ## [1.0.1] - 2026-10-28
 
 ### 新增：自更新

@@ -42,7 +42,7 @@ import {
   resolveConfig,
   tunableFields,
 } from '../core/config.mjs';
-import { createUpdater, readLocalVersion } from './self-update.mjs';
+import { createUpdater, normalizeRepoSlug, readLocalVersion } from './self-update.mjs';
 import { pickReclaimGroup, tokenUsage, totalCapacityOf } from '../core/budget.mjs';
 import { dedupEveryOf, dedupThresholdOf, findDuplicateGroups, mergeDuplicateGroup } from '../core/dedup.mjs';
 import {
@@ -152,8 +152,8 @@ const PLUGIN_VERSION = (() => {
   }
 })();
 
-/** 仓库地址（面板上「报告问题」那个链接用）。从 package.json 读，不写死。 */
-const PLUGIN_REPO = (() => {
+/** 仓库网页地址（面板上「报告问题」那个链接用，要整条网址）。从 package.json 读，不写死。 */
+export const PLUGIN_REPO_URL = (() => {
   try {
     const pkg = createRequire(import.meta.url)('../../package.json');
     const raw = typeof pkg?.repository === 'string' ? pkg.repository : String(pkg?.repository?.url ?? '');
@@ -162,6 +162,17 @@ const PLUGIN_REPO = (() => {
     return '';
   }
 })();
+/**
+ * 仓库 `owner/repo`（拼 GitHub API / codeload / issues 用）。
+ *
+ * 2026-10-28 修：原来只有上面那一个常量，被两处拿去用 —— 面板要的是整条网址，
+ * 更新器要的是短名。结果更新器拼出
+ * `https://api.github.com/repos/https://github.com/phfb/ebbinghaus-memory/tags`
+ * 这种地址，每次都 404，自更新等于死的（1.0.1 那次反馈就是这么来的）。
+ * 现在一律先过 normalizeRepoSlug()，两种格式各归各位。
+ */
+const PLUGIN_REPO = normalizeRepoSlug(PLUGIN_REPO_URL) || 'phfb/ebbinghaus-memory';
+
 /** 单条消息送进模型前截断的字符数（防一次长贴图把 maxTokens 吃光）。 */
 const MAX_MESSAGE_CHARS = 1200;
 /**
@@ -619,10 +630,22 @@ export function apply(ctx, rawConfig) {
     process.env.DSH_NO_AUTOUPDATE === '1' || rawConfig?.autoUpdate === false
       ? null
       : createUpdater({
-          repo: PLUGIN_REPO || 'phfb/ebbinghaus-memory',
+          repo: PLUGIN_REPO,
           localVersion: readLocalVersion(path.join(pluginRoot, 'package.json')),
           dataDir: libraryRoot,
-          mounts: [{ from: '', to: pluginRoot }],
+          /**
+           * 只覆盖真正要跟着上游走的那几样（= package.json 的 files 白名单）。
+           * 以前是 `from: ''` 全仓库根往插件目录里盖 —— .github / docs / test / tools /
+           * AGENTS.md 也会被糊进来，而且本机手改过的文件会被无声覆盖。现在范围收窄，
+           * 配合 self-update 里的逐文件比对 + 覆盖前备份，改没改过一查就知道。
+           */
+          mounts: [
+            {
+              from: '',
+              to: pluginRoot,
+              only: ['src', 'cordis.patch.yml', 'README.md', 'SPEC.md', 'CHANGELOG.md', 'LICENSE', 'package.json'],
+            },
+          ],
           log: (m) => log('更新：' + m),
           warn: (m) => warn('更新：' + m),
         });
@@ -3416,7 +3439,8 @@ export function apply(ctx, rawConfig) {
       consolidate: {
         log: consolidateLog.slice(),
         version: PLUGIN_VERSION,
-        repo: PLUGIN_REPO,
+        // 面板拿它拼 `<repo>/issues/new?...`，要整条网址（不是 owner/repo）
+        repo: PLUGIN_REPO_URL,
         chain: {
           fallbackActive,
           primaryProvider: config.provider || '',

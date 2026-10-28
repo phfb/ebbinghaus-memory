@@ -11,8 +11,20 @@
  *   跟 main 最新提交意味着任何一个推送都会被执行到本机，太野。默认只跟发版。
  *
  * 网络：直连 GitHub 优先，失败按 MIRRORS 依次重试（国内直连经常超时）。
+ *
+ * ── 2026-10-28 修的两件事 ────────────────────────────────────────────────
+ * 1. **仓库地址格式**：以前把这个模块的 `repo` 直接拼进
+ *    `https://api.github.com/repos/${repo}/...`，而调用方传的是 package.json 里
+ *    `repository.url` 的整条网址（`https://github.com/phfb/ebbinghaus-memory`），
+ *    于是请求变成 `api.github.com/repos/https://github.com/...` —— 每次都 404，
+ *    自更新等于死的（网页那边「报告问题」链接却需要完整 URL，所以那份不能删）。
+ *    现在一律先过 `normalizeRepoSlug()`，网址也认、`owner/repo` 也认，
+ *    拼 URL 只用 `owner/repo`。
+ * 2. **覆盖前留证据**：以前是把整个插件目录 cpSync 一份再全量覆盖，谁被改了说不清。
+ *    现在逐个文件比字节：只有真的不一样的才覆盖，覆盖前把旧文件备份到
+ *    `_update/backup/<时间戳>/`，并写 `report.json` 记下「换了哪些、新增哪些」。
+ *    本机手改过的补丁因此随时能捞回来。
  */
-import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import {
   cpSync,
@@ -41,13 +53,41 @@ function isLoadablePath(rel) {
   return LOADABLE_DIRS.includes(head)
 }
 
-/** 版本号比较：只认 x.y.z，缺位当 0。 */
+/**
+ * 把各种写法的仓库地址归一成 `owner/repo`。
+ *
+ * 认这些：
+ *   phfb/ebbinghaus-memory
+ *   https://github.com/phfb/ebbinghaus-memory
+ *   git+https://github.com/phfb/ebbinghaus-memory.git
+ *   git@github.com:phfb/ebbinghaus-memory.git
+ *   https://github.com/phfb/ebbinghaus-memory/tree/main
+ *
+ * 认不出来返回 ''（调用方自己兜底，别拿半截字符串去拼 API）。
+ */
+export function normalizeRepoSlug(input) {
+  let s = String(input ?? '').trim()
+  if (s === '') return ''
+  s = s.replace(/^git\+/i, '')
+  s = s.replace(/^git@([^:]+):/i, 'https://$1/')
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+\//i, '')
+  s = s.replace(/\.git$/i, '').replace(/\/+$/, '')
+  const parts = s.split('/').filter((p) => p !== '')
+  if (parts.length < 2) return ''
+  return `${parts[0]}/${parts[1]}`
+}
+
+/** 版本号比较：只认 x.y.z，缺位当 0（'1.0' 和 '1.0.0' 必须算相等）。 */
 export function compareVersion(a, b) {
-  const p = (v) => String(v || '')
-    .replace(/^v/i, '')
-    .split(/[.\-+]/)
-    .slice(0, 3)
-    .map((n) => Number.parseInt(n, 10) || 0)
+  const p = (v) => {
+    const parts = String(v || '')
+      .replace(/^v/i, '')
+      .split(/[.\-+]/)
+      .slice(0, 3)
+      .map((n) => Number.parseInt(n, 10) || 0)
+    while (parts.length < 3) parts.push(0)
+    return parts
+  }
   const x = p(a)
   const y = p(b)
   for (let i = 0; i < 3; i += 1) {
@@ -118,18 +158,55 @@ function withMirrors(url) {
 }
 
 /**
+ * 这个 zip 里的相对路径归不归这条 mount 管。
+ *
+ * `from` 为空 = 整个仓库根；`only` 是白名单，比较的是「`from` 底下的第一段名字」：
+ *   from: ''         only: ['src','package.json']      → src/a.mjs ✔ / docs/a.md ✘
+ *   from: 'dsh-qq-bot' only: ['lib','package.json']    → dsh-qq-bot/lib/a.js ✔ / dsh-qq-bot/test/a.js ✘
+ * 收窄是为了别把 .github / docs / test / tools 这些东西也糊到插件目录里，
+ * 也免得上游包里那份旧文件悄悄盖掉本机手改过的同名文件。
+ */
+export function matchesMount(mount, rel) {
+  if (mount.from === '') {
+    if (Array.isArray(mount.only) && mount.only.length > 0) {
+      return mount.only.includes(rel.split('/')[0])
+    }
+    return true
+  }
+  if (rel === mount.from) return true
+  if (!rel.startsWith(`${mount.from}/`)) return false
+  if (Array.isArray(mount.only) && mount.only.length > 0) {
+    const inside = rel.slice(mount.from.length + 1)
+    return mount.only.includes(inside.split('/')[0])
+  }
+  return true
+}
+
+/** 两个文件字节一样吗（读不动就当不一样，宁可多备份一次）。 */
+function sameBytes(pathA, bytesB) {
+  try {
+    if (!existsSync(pathA)) return false
+    return readFileSync(pathA).equals(bytesB)
+  } catch {
+    return false
+  }
+}
+
+/**
  * 造一个更新器。
  *
  * @param {object} opts
- * @param {string} opts.repo       例如 'phfb/ebbinghaus-memory'
+ * @param {string} opts.repo       仓库地址：'phfb/x' 或 'https://github.com/phfb/x' 都行
  * @param {string} opts.localVersion 本地 package.json 的 version
  * @param {string} opts.dataDir    暂存区落在 <dataDir>/_update
- * @param {Array<{from:string,to:string}>} opts.mounts
- *        zip 里 `<repo>-<sha>/<from>/**` → 本机 `<to>/**`（from 为 '' 表示整个仓库根）
+ * @param {Array<{from:string,to:string,only?:string[]}>} opts.mounts
+ *        zip 里 `<repo>-<sha>/<from>/**` → 本机 `<to>/**`（from 为 '' 表示整个仓库根，
+ *        可再用 only 收窄到顶层某几个名字）
  * @param {(m:string)=>void} [opts.log]
  * @param {(m:string)=>void} [opts.warn]
  */
 export function createUpdater({ repo, localVersion, dataDir, mounts, log = () => {}, warn = () => {} }) {
+  const slug = normalizeRepoSlug(repo)
   const base = join(dataDir, '_update')
   const pendingDir = join(base, 'pending')
   const manifestPath = join(pendingDir, 'manifest.json')
@@ -147,11 +224,17 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
     writeFileSync(p, `${JSON.stringify(v, null, 2)}\n`, 'utf8')
   }
 
+  const requireSlug = () => {
+    if (slug === '') throw new Error(`仓库地址不合法（要 owner/repo 或仓库 URL）：${String(repo)}`)
+    return slug
+  }
+
   /** 查最新版本：先 Releases，没有 Release 就退回 tags（发版不一定点 Release）。 */
   async function latestTag() {
+    const owner = requireSlug()
     try {
       const { res } = await fetchAny(
-        withMirrors(`https://api.github.com/repos/${repo}/releases/latest`),
+        withMirrors(`https://api.github.com/repos/${owner}/releases/latest`),
         { ms: 15000, headers: { accept: 'application/vnd.github+json' } },
       )
       const body = await res.json()
@@ -162,7 +245,7 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
       /* 没发 Release 时这里 404，正常的 */
     }
     const { res } = await fetchAny(
-      withMirrors(`https://api.github.com/repos/${repo}/tags?per_page=20`),
+      withMirrors(`https://api.github.com/repos/${owner}/tags?per_page=20`),
       { ms: 15000, headers: { accept: 'application/vnd.github+json' } },
     )
     const list = await res.json()
@@ -177,7 +260,8 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
 
   /** 下载 zip → 拆到暂存区 → 逐文件校验。任何一步失败都不留半成品。 */
   async function stage(tag) {
-    const zipUrl = `https://codeload.github.com/${repo}/zip/${encodeURIComponent(tag)}`
+    const owner = requireSlug()
+    const zipUrl = `https://codeload.github.com/${owner}/zip/${encodeURIComponent(tag)}`
     const { res, url } = await fetchAny(withMirrors(zipUrl), { ms: 60000 })
     const buf = Buffer.from(await res.arrayBuffer())
     if (buf.length < 1024) throw new Error('下载到的包太小，可能不是 zip')
@@ -197,11 +281,12 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
       const rel = parts.join('/')
       if (rel === '') continue
       if (SKIP_DIRS.has(parts[0])) continue
-      const mount = mounts.find((m) => (m.from === '' ? true : rel === m.from || rel.startsWith(`${m.from}/`)))
-      if (!mount) continue
+      const mountIndex = mounts.findIndex((m) => matchesMount(m, rel))
+      if (mountIndex < 0) continue
+      const mount = mounts[mountIndex]
       const inside = mount.from === '' ? rel : rel.slice(mount.from.length + 1)
       if (inside === '') continue
-      const dest = join(staged, String(mounts.indexOf(mount)), normalize(inside))
+      const dest = join(staged, String(mountIndex), normalize(inside))
       if (!dest.startsWith(staged + sep)) continue
       mkdirSync(dirname(dest), { recursive: true })
       writeFileSync(dest, f.data)
@@ -239,47 +324,94 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
     }
 
     writeJson(manifestPath, {
-      repo,
+      repo: owner,
       tag,
       version: String(tag).replace(/^v/i, ''),
       stagedAt: new Date().toISOString(),
       source: url,
       files: written,
-      mounts: mounts.map((m) => ({ from: m.from, to: m.to })),
+      mounts: mounts.map((m) => ({ from: m.from, to: m.to, only: m.only ?? null })),
     })
     return { tag, files: written }
   }
 
-  /** 下一次启动时调用：装上次下载好的那份。 */
+  /**
+   * 下一次启动时调用：装上次下载好的那份。
+   *
+   * 逐文件比字节 —— 一样的跳过，不一样的先备份再覆盖，最后写一份 report.json。
+   * 本机手改过的地方因此永远有据可查、可回滚。
+   */
   function applyPending() {
     const manifest = readJson(manifestPath)
     if (manifest === null) return null
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    const backupRoot = join(base, 'backup', stamp)
+    const report = {
+      tag: manifest.tag,
+      repo: manifest.repo,
+      installedAt: new Date().toISOString(),
+      backupDir: backupRoot,
+      replaced: [],
+      added: [],
+      kept: [],
+    }
     try {
       for (const [i, mount] of mounts.entries()) {
         const root = join(pendingDir, 'files', String(i))
         if (!existsSync(root)) continue
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-        const backup = join(base, 'backup', `${String(i)}-${stamp}`)
-        try {
-          cpSync(mount.to, backup, { recursive: true, force: true })
-        } catch (err) {
-          warn(`更新备份失败（继续装）：${err instanceof Error ? err.message : String(err)}`)
-        }
+        const targetRoot = normalize(mount.to)
         for (const file of walk(root)) {
           const rel = file.slice(root.length + 1)
-          const dest = join(mount.to, rel)
+          const dest = normalize(join(targetRoot, rel))
+          if (dest !== targetRoot && !dest.startsWith(targetRoot + sep)) continue
+          const next = readFileSync(file)
+          if (sameBytes(dest, next)) {
+            report.kept.push(dest)
+            continue
+          }
           mkdirSync(dirname(dest), { recursive: true })
-          cpSync(file, dest)
+          if (existsSync(dest)) {
+            const backupPath = join(backupRoot, String(i), rel)
+            try {
+              mkdirSync(dirname(backupPath), { recursive: true })
+              cpSync(dest, backupPath)
+              report.replaced.push({ file: dest, backup: backupPath })
+            } catch (err) {
+              // 备份失败也要继续装，但必须留痕 —— 不然「悄悄改了本地文件」就查不到了
+              report.replaced.push({
+                file: dest,
+                backup: '',
+                error: err instanceof Error ? err.message : String(err),
+              })
+              warn(`备份 ${dest} 失败（继续装）：${err instanceof Error ? err.message : String(err)}`)
+            }
+            writeFileSync(dest, next)
+          } else {
+            writeFileSync(dest, next)
+            report.added.push(dest)
+          }
         }
+      }
+      try {
+        writeJson(join(backupRoot, 'report.json'), report)
+      } catch {
+        /* 报告写不进去不影响已经装好的文件 */
       }
       writeJson(statePath, {
         installedTag: manifest.tag,
-        installedAt: new Date().toISOString(),
+        installedAt: report.installedAt,
         files: manifest.files,
+        replaced: report.replaced.length,
+        added: report.added.length,
+        kept: report.kept.length,
+        backupDir: report.replaced.length > 0 ? backupRoot : '',
       })
       rmSync(pendingDir, { recursive: true, force: true })
-      log(`已安装 ${manifest.tag}（${manifest.files} 个文件），下一次启动生效`)
-      return manifest
+      log(
+        `已装 ${manifest.tag}：替换 ${report.replaced.length} / 新增 ${report.added.length} / 未变 ${report.kept.length}` +
+          (report.replaced.length > 0 ? `（旧文件备份在 ${backupRoot}）` : ''),
+      )
+      return { ...manifest, report }
     } catch (err) {
       warn(`安装更新失败，保留暂存区下次再试：${err instanceof Error ? err.message : String(err)}`)
       return null
@@ -291,29 +423,43 @@ export function createUpdater({ repo, localVersion, dataDir, mounts, log = () =>
     try {
       const { tag, from } = await latestTag()
       if (compareVersion(tag, localVersion) <= 0) {
-        writeJson(statePath, { ...(readJson(statePath) || {}), checkedAt: new Date().toISOString(), latestTag: tag })
+        // 成功一次就把上次的 lastError 抹掉：不然面板/state.json 里会一直挂着
+        // 一条早就修好的 404，看着像「还是坏的」
+        writeJson(statePath, { checkedAt: new Date().toISOString(), latestTag: tag })
         log(`已是最新（本地 ${localVersion} / 远端 ${tag}，来源 ${from}）`)
         return { ok: true, updated: false, tag }
       }
       // 已经下过同一个 tag 就别重复下
       const already = readJson(manifestPath)
       if (already && already.tag === tag) {
+        writeJson(statePath, { checkedAt: new Date().toISOString(), latestTag: tag, stagedTag: tag })
         log(`已有 ${tag} 的暂存包，等下次启动安装`)
         return { ok: true, updated: false, staged: true, tag }
       }
       log(`发现新版本 ${tag}（来源 ${from}），开始下载…`)
       const staged = await stage(tag)
+      writeJson(statePath, { checkedAt: new Date().toISOString(), latestTag: tag, stagedTag: staged.tag })
       log(`已下载并校验 ${staged.tag}（${staged.files} 个文件），下次启动生效`)
       return { ok: true, updated: true, staged: true, tag }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      writeJson(statePath, { ...(readJson(statePath) || {}), checkedAt: new Date().toISOString(), lastError: msg })
+      writeJson(statePath, {
+        ...(readJson(statePath) || {}),
+        checkedAt: new Date().toISOString(),
+        lastError: msg,
+      })
       warn(`检查更新失败（不影响使用）：${msg}`)
       return { ok: false, error: msg }
     }
   }
 
-  return { checkAndStage, applyPending, pending: () => readJson(manifestPath), state: () => readJson(statePath) }
+  return {
+    checkAndStage,
+    applyPending,
+    repo: slug,
+    pending: () => readJson(manifestPath),
+    state: () => readJson(statePath),
+  }
 }
 
 /** 递归列出文件（不跟符号链接）。 */
