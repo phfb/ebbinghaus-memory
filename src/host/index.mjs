@@ -30,6 +30,7 @@
 
 import { appendFileSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -41,6 +42,7 @@ import {
   resolveConfig,
   tunableFields,
 } from '../core/config.mjs';
+import { createUpdater, readLocalVersion } from './self-update.mjs';
 import { pickReclaimGroup, tokenUsage, totalCapacityOf } from '../core/budget.mjs';
 import { dedupEveryOf, dedupThresholdOf, findDuplicateGroups, mergeDuplicateGroup } from '../core/dedup.mjs';
 import {
@@ -607,6 +609,38 @@ export function apply(ctx, rawConfig) {
   /** 记忆库目录：apply 时一次算定 */
   /** 库根（配置里的 dataDir）：里面放 spaces.json 和 spaces\ 分区目录。 */
   const libraryRoot = resolveDataDir(baseConfig);
+  /* ── 自更新（2026-10-28）─────────────────────────────────────────
+     顺序：先把上一次下载好、校验过的那份装上（**这次启动仍跑旧代码**，下次才生效），
+     再异步去 GitHub 看一眼有没有新版本，有就下到 <库根>/_update/pending。
+     全程 try/catch：更新坏了绝不能连累记忆功能。
+     关掉：环境变量 DSH_NO_AUTOUPDATE=1，或 config.autoUpdate = false。 */
+  const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const updater =
+    process.env.DSH_NO_AUTOUPDATE === '1' || rawConfig?.autoUpdate === false
+      ? null
+      : createUpdater({
+          repo: PLUGIN_REPO || 'phfb/ebbinghaus-memory',
+          localVersion: readLocalVersion(path.join(pluginRoot, 'package.json')),
+          dataDir: libraryRoot,
+          mounts: [{ from: '', to: pluginRoot }],
+          log: (m) => log('更新：' + m),
+          warn: (m) => warn('更新：' + m),
+        });
+
+  if (updater !== null) {
+    try {
+      const installed = updater.applyPending();
+      if (installed !== null) log(`更新：已装上 ${installed.tag}，再启动一次就是新代码`);
+    } catch (err) {
+      warn(`更新：安装暂存包失败（不影响使用）：${err instanceof Error ? err.message : String(err)}`);
+    }
+    // 8 秒后再去查：别和加载、建库抢时间；unref 掉，不拖住进程退出
+    const timer = setTimeout(() => {
+      Promise.resolve(updater.checkAndStage()).catch(() => {});
+    }, 8000);
+    if (typeof timer.unref === 'function') timer.unref();
+  }
+
   /** 分区账本：当前激活哪个、都有哪些、有没有刚搬过家。 */
   const spaceInfo = ensureSpaces(libraryRoot);
   /** 当前激活分区的目录 —— 下面几百行里所有的「库目录」指的都是它。 */
