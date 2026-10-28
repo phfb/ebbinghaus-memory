@@ -12,6 +12,24 @@ node tools/check-patch-yaml.mjs
 
 ---
 
+## [1.0.1] - 2026-10-28
+
+### 新增：自更新
+
+- **`src/host/self-update.mjs`**：启动时看一眼 GitHub 上有没有比本地新的发版 tag。
+  只认 Release / tag（不跟 main 提交），下载 → 自解 zip（只依赖 zlib）→ 逐文件校验
+  （`src|lib|bin` 下的 `.js/.mjs` 过 `node --check`，`.json` 过 parse）→ 存到
+  `<库根>/_update/pending` → **下一次启动**安装，装前把旧目录整份备份到 `_update/backup/<时间戳>`。
+- 为什么分两次启动：插件没法在自己的代码被 import 之前替换自己。代价是晚一次启动，
+  换来的是永远不会因为半新半旧的代码把插件弄死。
+- 网络：直连 GitHub 优先，失败按 `ghproxy.net` → `gh-proxy.com` 重试。
+- 关掉：环境变量 `DSH_NO_AUTOUPDATE=1`，或 `autoUpdate: false`。
+- 校验范围特意只到 `src|lib|bin`：`tools/restore.mjs` 本来就有语法错误（第 90 行），
+  不能让一个手动工具的坏语法把整包更新挡死。
+
+### 修复
+
+- **`resolveTargetSession`（alive 侧协议）不再往桌面会话里投念头** —— 详情见 dsh-qq-bot 的 CHANGELOG。
 ## [1.0.0] - 2026-10-28
 
 ### 行为变化（升级前先看一眼）
