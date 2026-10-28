@@ -309,7 +309,22 @@ test('client: 只往 sidebar.panellist 加一个图标，order 42', () => {
   const icons = registered.filter((r) => r.def.name === 'sidebar.panellist');
   assert.equal(icons.length, 1, '侧栏位置是稀缺资源，只占一格');
   assert.equal(icons[0].def.order, 42);
-  assert.deepEqual([...injects], ['sidebar.panellist', 'main'], '两个 slot 各注入一次');
+  assert.deepEqual(
+    [...injects],
+    ['sidebar.panellist', 'main', 'conversation.composer.dock', 'conversation.hero.options'],
+    '四个 slot 各注入一次（后两个是「脑子：xx」，开口前 / 开口后各一条）',
+  );
+});
+
+test('client: 脑子标签用它自己的 id，不顶掉 DSH 自带的用量小条', () => {
+  const { registered } = mount();
+  const chip = registered.find((r) => r.def.name === 'conversation.composer.dock');
+  assert.ok(chip, 'dock 上要有注册');
+  assert.equal(chip.def.id, 'ebbinghaus-space-chip', '全新 id 才会并排加一格，复用别人的 id 会顶掉那一格');
+
+  const heroChip = registered.find((r) => r.def.name === 'conversation.hero.options');
+  assert.ok(heroChip, '新对话那一屏也要有');
+  assert.equal(heroChip.def.id, 'ebbinghaus-space-chip-hero', '两条各有各的 id，别互相顶掉');
 });
 
 test('client: 侧栏 id 与主面板 key 一致，否则点了没反应', () => {

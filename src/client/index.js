@@ -1182,6 +1182,180 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /* ─────────────────────── 对话页底的小标签 ─────────────────────── */
+
+    /**
+     * 「脑子：私生活」—— 挂在对话输入框下面那条 dock 上（2026-10-28 他要求）。
+     *
+     * 只说一件事：**这个会话记忆存在哪个分区**。点开一句解释，没有任何按钮。
+     * 改分区是面板的事（侧栏 → 记忆 → 当前记忆分区），这里不提供第二个入口 ——
+     * 两个地方能改，迟早会有人说"我明明在这儿改过"。
+     *
+     * 数据来自 GET /ebbinghaus/session-space?session=<id>（host 侧只读接口）。
+     * props.sessionId 由宿主按 session 作用域传进来；拿不到就不渲染。
+     */
+    function SpaceChip(props) {
+      const sessionId = props && typeof props.sessionId === 'string' ? props.sessionId : '';
+      const [info, setInfo] = useState(null);
+      const [open, setOpen] = useState(false);
+      const [failed, setFailed] = useState(false);
+
+      // 拉一次这个会话的分区。点开时再拉一次 —— 同一个会话中途被改绑（只有 bot
+      // 专区会这样）也能当场看到，不用等切换会话。没有轮询：一个只读标签不值一个定时器。
+      const load = () => {
+        if (sessionId === '') return;
+        fetch(`${API}/session-space?session=${encodeURIComponent(sessionId)}`, {
+          headers: { Accept: 'application/json' },
+        })
+          .then((r) => (r && typeof r.json === 'function' ? r.json() : {}))
+          .then((body) => {
+            if (body && body.ok) {
+              setInfo(body);
+              setFailed(false);
+            } else {
+              setFailed(true);
+            }
+          })
+          .catch(() => setFailed(true));
+      };
+
+      useEffect(() => {
+        if (sessionId === '') {
+          setInfo(null);
+          return;
+        }
+        load();
+      }, [sessionId]);
+
+      // 点别处 / 按 Esc 就收起来。点在按钮上时不冒泡（见 onClick 里的 stopPropagation）。
+      useEffect(() => {
+        if (!open) return undefined;
+        const close = () => setOpen(false);
+        const onKey = (e) => {
+          if (e && e.key === 'Escape') setOpen(false);
+        };
+        document.addEventListener('click', close);
+        document.addEventListener('keydown', onKey);
+        return () => {
+          document.removeEventListener('click', close);
+          document.removeEventListener('keydown', onKey);
+        };
+      }, [open]);
+
+      // 没有会话 / 接口挂了 → 整条不出现。宁可少一条标签，也不要挂个"未知"在那里。
+      if (sessionId === '' || failed || info === null) return null;
+
+      const spaceId = typeof info.spaceId === 'string' ? info.spaceId : '';
+      const spaceName = typeof info.spaceName === 'string' && info.spaceName !== '' ? info.spaceName : spaceId;
+      const where = spaceId !== '' && spaceName !== spaceId ? `${spaceName}（${spaceId}）` : spaceName;
+
+      return h(
+        'div',
+        { style: { position: 'relative', display: 'inline-flex' } },
+        h(
+          'button',
+          {
+            type: 'button',
+            // 只放图标（2026-10-28 他要求）：文字会把 dock 撑长，分区名点开才看。
+            title: `当前会话记忆分区：${spaceName}`,
+            'aria-label': `当前会话的记忆分区：${spaceName}`,
+            'aria-expanded': open ? 'true' : 'false',
+            onClick: (e) => {
+              if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+              const next = !open;
+              setOpen(next);
+              if (next) load();
+            },
+            style: {
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 5,
+              padding: '2px 9px',
+              border: `1px solid ${C.border1}`,
+              borderRadius: 999,
+              background: 'transparent',
+              color: C.text2,
+              font: 'inherit',
+              fontSize: 12,
+              lineHeight: '18px',
+              cursor: 'pointer',
+            },
+          },
+          h(BrainIcon, { size: 14 }),
+          // 图标后面只跟「：分区名」——「脑子」两个字他让删掉（2026-10-28）。
+          `：${spaceName}`,
+        ),
+        open
+          ? h(
+              'div',
+              {
+                role: 'dialog',
+                onClick: (e) => {
+                  if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+                },
+                style: {
+                  position: 'absolute',
+                  bottom: 'calc(100% + 6px)',
+                  // 靠右对齐：这个标签本来就贴在右边（新对话那排的最右、或者 dock 的状态条里），
+                  // 用 left:0 会往右长、被窗口边缘切掉一半（2026-10-28 实测）。
+                  right: 0,
+                  zIndex: 40,
+                  width: 268,
+                  maxWidth: '70vw',
+                  padding: '10px 12px',
+                  border: `1px solid ${C.border1}`,
+                  borderRadius: 10,
+                  background: C.layer1,
+                  color: C.text2,
+                  fontSize: 12,
+                  lineHeight: 1.7,
+                  textAlign: 'left',
+                },
+              },
+              h('div', { style: { color: C.text1, marginBottom: 6 } }, '当前会话记忆分区'),
+              h('div', null, `当前会话记忆存在：${where}`),
+              h(
+                'div',
+                { style: { marginTop: 6, fontSize: 11, color: C.text2 } },
+                '若要修改，请前往侧边栏「记忆」里改分区。',
+              ),
+              h(
+                'div',
+                { style: { marginTop: 4, fontSize: 11, color: C.text2 } },
+                '记忆分区跟随首次对话选择，无法再次切换。',
+              ),
+            )
+          : null,
+      );
+    }
+
+    /** 脑子图标：两瓣 + 中间一道沟。只用 currentColor，跟着主题走。 */
+    function BrainIcon(props) {
+      const size = props && typeof props.size === 'number' ? props.size : 14;
+      const lobe = {
+        stroke: 'currentColor',
+        strokeWidth: 1.5,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        fill: 'none',
+      };
+      return h(
+        'svg',
+        { width: size, height: size, viewBox: '0 0 24 24', 'aria-hidden': true, style: { display: 'block' } },
+        h('path', {
+          ...lobe,
+          d:
+            'M12 4.1c-1.5 0-2.8.8-3.3 2-1.5.1-2.7 1.3-2.7 2.8 0 .5.1 1 .4 1.4-.9.5-1.5 1.4-1.5 2.4 0 1.1.6 2 1.5 2.5-.2.4-.4.8-.4 1.3 0 1.5 1.2 2.7 2.7 2.7.6 0 1.1-.2 1.6-.5.4.8 1.2 1.3 2.2 1.3',
+        }),
+        h('path', {
+          ...lobe,
+          d:
+            'M12 4.1c1.5 0 2.8.8 3.3 2 1.5.1 2.7 1.3 2.7 2.8 0 .5-.1 1-.4 1.4.9.5 1.5 1.4 1.5 2.4 0 1.1-.6 2-1.5 2.5.2.4.4.8.4 1.3 0 1.5-1.2 2.7-2.7 2.7-.6 0-1.1-.2-1.6-.5-.4.8-1.2 1.3-2.2 1.3',
+        }),
+        h('path', { d: 'M12 4.1v15.4', stroke: 'currentColor', strokeWidth: 1, strokeOpacity: 0.45 }),
+      );
+    }
+
     /* ───────────────────────── 主面板 ───────────────────────── */
 
     /** POST 收口：统一头、统一错误、统一「返回体可能是空/非 JSON」。 */
@@ -2317,6 +2491,36 @@ window.__ModuleLoader__.load({
       );
 
       ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL_ID }, Panel));
+
+      /**
+       * 对话页底那条「脑子：私生活」。**纯只读** —— 没有写入口、没有按钮，
+       * 只回答"这个会话往哪儿写"。order 60：排在 DSH 自己的用量/状态小条后面。
+       */
+      ctx.slots.inject('conversation.composer.dock', () =>
+        ctx.slots.register(
+          { name: 'conversation.composer.dock', id: 'ebbinghaus-space-chip', order: 60 },
+          SpaceChip,
+        ),
+      );
+
+      /**
+       * 同一个标签，**开新对话之前**那一屏也要有（2026-10-28 他补的）。
+       *
+       * 两屏互斥，不会同时出现两条：
+       *  - 新对话还没开口 → `conversation.composer.bar` 的 variant 是 `hero`，
+       *    底下的 dock 槽根本不渲染，只剩 hero 这一行（工作区 / 预设 后面）；
+       *  - 开了口 → 变回 `composer`，hero 行整块消失，dock 那条出现。
+       *
+       * 注意 hero.options 要求「有 sessionId」才渲染（空会话也算），
+       * 所以这里拿到的仍然是一个会话 id，只是还没绑分区 —— 接口会回当前激活分区，
+       * 正好是"这条新对话将会写进哪儿"。
+       */
+      ctx.slots.inject('conversation.hero.options', () =>
+        ctx.slots.register(
+          { name: 'conversation.hero.options', id: 'ebbinghaus-space-chip-hero', order: 20 },
+          SpaceChip,
+        ),
+      );
     }
 
     return { name: 'ebbinghaus-memory', inject: ['slots'], apply };

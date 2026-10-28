@@ -512,6 +512,7 @@ test('HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
     '/ebbinghaus/reclaim',
     '/ebbinghaus/recover',
     '/ebbinghaus/reload',
+    '/ebbinghaus/session-space',
     '/ebbinghaus/settings',
     '/ebbinghaus/spaces/active',
     '/ebbinghaus/spaces/bind',
@@ -1357,7 +1358,7 @@ function makeTwoSpaces(dir, bindings = {}) {
       version: 1,
       active: 'private',
       spaces: [
-        { id: 'private', name: '个人', createdAt: new Date().toISOString() },
+        { id: 'private', name: '私生活', createdAt: new Date().toISOString() },
         { id: 'work', name: '工作', createdAt: new Date().toISOString() },
       ],
     }),
@@ -1587,7 +1588,7 @@ test('配置分层：两个分区各用各自的 settings.json', async (t) => {
 
   const s1 = await getState(h);
   assert.equal(s1.spaces.active, 'private');
-  assert.equal(fieldValue(s1, 'shortCapacity'), 200, '个人应当用自己的 200');
+  assert.equal(fieldValue(s1, 'shortCapacity'), 200, '私生活应当用自己的 200');
 
   const switched = await callPost(h, '/ebbinghaus/spaces/active', { id: 'work' });
   assert.equal(switched.body.ok, true);
@@ -1653,7 +1654,7 @@ test('QQ 转进来的消息也能触发固化（source.kind = qq）', async (t) 
   // dsh-qq-bot 造的消息：source.kind 是 'qq'，不是 'user'（见它的 SOURCE_KIND）
   h.emit('session/event', { id: 'sess-qq' }, {
     type: 'user/message',
-    data: { source: { kind: 'qq', uin: '123456789' }, content: [{ type: 'text', text: '在吗' }] },
+    data: { source: { kind: 'qq', uin: '3448932873' }, content: [{ type: 'text', text: '在吗' }] },
   });
   h.emit('agent/turn-stopping', { agent });
   await h.services.get('ebbinghausMemory').flush();
@@ -2043,12 +2044,12 @@ test('bot 专区：开关开着 + 号对得上 → 会话绑到指定分区', as
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '123456789',
+    botUins: '3448932873',
   });
 
   const agent = makeAgent('sess-bot', h.sections);
   h.emit('agent/created', { agent });
-  await sayWithSource(h, agent, 'sess-bot', '在吗', { kind: 'qq', uin: '123456789' });
+  await sayWithSource(h, agent, 'sess-bot', '在吗', { kind: 'qq', uin: '3448932873' });
 
   assert.equal(readBindings(dir)['sess-bot'], 'work', 'QQ 会话要绑到 bot 专区');
 });
@@ -2065,7 +2066,7 @@ test('bot 专区：号不在名单里 / 开关关着 → 还是跟着默认分�
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '123456789',
+    botUins: '3448932873',
   });
 
   const agent = makeAgent('sess-other', h.sections);
@@ -2098,8 +2099,169 @@ test('bot 专区：指定的分区不存在时不崩，退回默认分区', asyn
   assert.equal(readBindings(dir)['sess-nospace'], 'private', '分区不存在要退回默认，而不是报错');
 });
 
-/* ── 2026-10-27：装了 qq-bot 时，bot 专区开关锁死（防「神人操作」） ── */
+/* ── 2026-10-28：会话在「第一条消息之前」就被建好时，绑定不能提前钉死 ──
+   qq-bot 换局时会先 agents.create()，会话在那一秒就发出不带 source 的
+   header / 插件记录；这时如果按「当时激活的分区」绑，QQ 消息进来就改不动了。 */
 
+test('bot 专区：会话先被不带 source 的事件建出来 → 第一条 QQ 消息仍然绑专区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir); // private(active) + work
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '3448932873',
+  });
+
+  const agent = makeAgent('sess-pre', h.sections);
+  h.emit('agent/created', { agent });
+  // 建会话时的那条记录：没有 source（qq-bot 换局就是这样）
+  h.emit('session/event', { id: 'sess-pre' }, { type: 'session/opened', data: {} });
+  assert.equal(readBindings(dir)['sess-pre'], undefined, '没带 source 的事件不许建绑定');
+
+  await sayWithSource(h, agent, 'sess-pre', '在吗', { kind: 'qq', uin: '3448932873' });
+  assert.equal(readBindings(dir)['sess-pre'], 'work', '第一条 QQ 消息要把会话绑到专区');
+});
+
+test('bot 专区：已经被钉到别的分区的 QQ 会话，下一条消息改回锁定分区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir, { 'sess-wrong': 'private' }); // 历史上被提前钉错的样子
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '3448932873',
+  });
+
+  const agent = makeAgent('sess-wrong', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-wrong', '在吗', { kind: 'qq', uin: '3448932873' });
+
+  assert.equal(readBindings(dir)['sess-wrong'], 'work', '锁定分区优先于历史错绑定');
+});
+
+test('bot 专区：桌面端会话（source.kind=user）不会被专区锁定拉走', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir, { 'sess-desk': 'private' });
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '',
+  });
+
+  const agent = makeAgent('sess-desk', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-desk', '在吗', { kind: 'user' });
+
+  assert.equal(readBindings(dir)['sess-desk'], 'private', '桌面会话按自己的绑定走，不受专区影响');
+});
+
+test('bot 专区：qq-bot 派的活（kind=dsh-qq-bot、不带 uin）也算桥接，照样绑专区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir); // private(active) + work
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '3448932873', // 设了号也不该把「没号的任务消息」挡在外面
+  });
+
+  const agent = makeAgent('sess-task', h.sections);
+  h.emit('agent/created', { agent });
+  h.emit('session/event', { id: 'sess-task' }, {
+    type: 'user/message',
+    data: {
+      source: { kind: 'dsh-qq-bot', reason: 'qzone-diary' },
+      content: [{ type: 'text', text: '【今天的日记】到点了' }],
+    },
+  });
+  await h.services.get('ebbinghausMemory').flush();
+
+  assert.equal(readBindings(dir)['sess-task'], 'work', '任务消息也得认成桥接，别钉到激活分区');
+});
+
+test('bot 专区：带了别的号 → 不拦到专区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir);
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '3448932873',
+  });
+
+  const agent = makeAgent('sess-stranger', h.sections);
+  h.emit('agent/created', { agent });
+  h.emit('session/event', { id: 'sess-stranger' }, {
+    type: 'user/message',
+    data: { source: { kind: 'qq', uin: '10001' }, content: [{ type: 'text', text: '在吗' }] },
+  });
+  await h.services.get('ebbinghausMemory').flush();
+
+  assert.equal(readBindings(dir)['sess-stranger'], 'private', '不在名单里的号跟着激活分区走');
+});
+
+/* ── 2026-10-28：对话页底那条「脑子：xx」用的只读接口 ── */
+
+test('session-space：按会话返回它绑的分区，缺 session 就 400，不给 POST', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir, { 'sess-chip': 'work' });
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const ok = fakeRes();
+  await h.route('/ebbinghaus/session-space').handler(
+    fakeReq({ url: '/ebbinghaus/session-space?session=sess-chip' }),
+    ok,
+  );
+  assert.equal(ok.statusCode, 200);
+  const body = ok.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.spaceId, 'work', '会话绑哪个分区就报哪个');
+  assert.equal(body.spaceName, '工作');
+
+  const missing = fakeRes();
+  await h.route('/ebbinghaus/session-space').handler(fakeReq({ url: '/ebbinghaus/session-space' }), missing);
+  assert.equal(missing.statusCode, 400, '没给 session 要拒');
+
+  const post = fakeRes();
+  await h.route('/ebbinghaus/session-space').handler(
+    fakeReq({ method: 'POST', url: '/ebbinghaus/session-space?session=sess-chip', body: {} }),
+    post,
+  );
+  assert.equal(post.statusCode, 405, '只读接口不许写');
+});
+
+/* ── 2026-10-27：装了 qq-bot 时，bot 专区开关锁死（防「神人操作」） ── */
 test('装了 dsh-qq-bot 时：开关写 false 也强制开，QQ 会话照样进专区', async (t) => {
   const dir = await tempDir();
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -2119,7 +2281,7 @@ test('装了 dsh-qq-bot 时：开关写 false 也强制开，QQ 会话照样进�
 
   const agent = makeAgent('sess-lock', h.sections);
   h.emit('agent/created', { agent });
-  await sayWithSource(h, agent, 'sess-lock', '在吗', { kind: 'qq', uin: '123456789' });
+  await sayWithSource(h, agent, 'sess-lock', '在吗', { kind: 'qq', uin: '3448932873' });
 
   assert.equal(readBindings(dir)['sess-lock'], 'work', '装了 QQ bot 就不允许关专区');
 

@@ -905,18 +905,26 @@ export function apply(ctx, rawConfig) {
    *
    * 三种情况都退回 undefined，一种都不硬来：
    *  - 开关没开（且没装 qq-bot）
-   *  - 来源不在白名单里，或者不在 `botUins` 指定的号里
+   *  - 来源不是桥接（桌面端自己打字），或者带号但不在 `botUins` 指定的号里
    *  - 指定的分区不存在（**不自动建目录** —— 乱建比不建更难收拾）
    */
   function spaceForIncoming(source) {
     if (!botSpaceEnabledEffective()) return undefined;
-    const kind = source?.kind;
-    if (typeof kind !== 'string' || !userSourceKinds().includes(kind)) return undefined;
+    // 2026-10-28 修：原来这里只查 `sourceKinds` 白名单，而白名单默认就含 `user`
+    // （桌面端自己打字就是 `user`）。于是「bot 记忆专区」会把**桌面端会话也一起
+    // 抓进锁定分区**：用户在面板上切了分区，新开的桌面会话却还是进 private，
+    // 看起来像「切换不生效」。专区按定义只管桥接进来的（QQ 等），桌面永远跟着
+    // 当前激活分区走。
+    if (!isBridgedSource(source?.kind)) return undefined;
 
     const uins = botUins();
     if (uins.length > 0) {
       const uin = String(source?.uin ?? '').trim();
-      if (uin === '' || !uins.includes(uin)) return undefined;
+      // 有号但不在名单里 → 不是这个专区要的号。
+      // **没号不拦**：qq-bot 派的活（写日记 / 轮询说说）本来就不带 uin，
+      // 但它属于同一个 QQ 会话，照样得绑到专区里 —— 否则它会把刚建好的新一局
+      // 先钉到"当时激活的分区"上，等下一条真消息进来再被改回来，中间那几轮白写。
+      if (uin !== '' && !uins.includes(uin)) return undefined;
     }
 
     const target = botSpaceId();
@@ -927,6 +935,20 @@ export function apply(ctx, rawConfig) {
       return undefined;
     }
     return target;
+  }
+
+  /**
+   * 这条来源算不算「桥接进来的」（QQ 之类），bot 专区只认这种。
+   *
+   * 桌面端自己打字的 `source.kind` 是 `user`，它不是桥接 —— 见 `spaceForIncoming`。
+   * 除了 `user`，任何非空 kind 都算桥接：不要求它在 `sourceKinds` 白名单里。
+   * 白名单管的是「这句话要不要当成人话记进记忆」，跟「它属于哪个分区」是两件事。
+   * 比如 qq-bot 派的活（`kind = 'dsh-qq-bot'`，写日记 / 轮询说说走这条）不在白名单里
+   * —— 它不写记忆，但它属于**那个 QQ 会话**，绑分区时必须认得出是桥接，
+   * 否则新一局在建出来那一刻就先被任务消息钉到"当时激活的分区"上了。
+   */
+  function isBridgedSource(kind) {
+    return typeof kind === 'string' && kind !== '' && kind !== 'user';
   }
 
   /** `botUins` 解析成数组。空 / 坏值 → 空数组（= 不按号过滤）。 */
@@ -940,9 +962,22 @@ export function apply(ctx, rawConfig) {
 
   function bindSessionIfNew(sessionId, source) {
     // bot 专区命中就绑专区，否则还是绑当前激活分区（老行为）
-    const target = spaceForIncoming(source) ?? activeSpaceId;
-    if (!bindIfNew(bindings, sessionId, target)) return;
+    const botTarget = spaceForIncoming(source);
+    const target = botTarget ?? activeSpaceId;
+    if (bindIfNew(bindings, sessionId, target)) {
+      persistBindings();
+      return;
+    }
+    // 已经绑过的会话一般不动（这就是「旧会话留在原分区」）。
+    // **例外**：bot 来源且专区锁定 —— 这类会话必须钉在锁定分区上。历史绑定可能是
+    // 「被提前钉下的错值」（见 session/event 钩子里的注释），见到真身就改回来。
+    if (botTarget === undefined) return;
+    const prev = bindings[sessionId];
+    if (prev === botTarget) return;
+    bindings[sessionId] = botTarget;
     persistBindings();
+    invalidateRender(sessionId);
+    log(`会话 ${String(sessionId)} 原来绑在「${prev}」，按 bot 专区锁定改到「${botTarget}」`);
   }
 
   /** 把绑定表落盘（失败只 warn —— 记不住绑定不影响记忆）。 */
@@ -1400,8 +1435,15 @@ export function apply(ctx, rawConfig) {
       if (typeof id !== 'string' || id === '') return;
       // 会话第一次出现就把它钉在当前分区上：之后再切，这个会话也不会被抢走。
       // 绑分区时要看来源：bot 来的（QQ 之类）可能要落到「bot 记忆专区」。
-      // 只有 user/message 带得动 source，别的事件按默认分区绑。
-      bindSessionIfNew(id, event?.type === 'user/message' ? event?.data?.source : undefined);
+      //
+      // 2026-10-28 修：这里原来**每个事件**都绑，包括建会话时那条不带 source 的
+      // header / 插件记录。而 qq-bot 是自己提前把会话建出来的（换局那一刻），
+      // 于是会话在被建出来的那一秒就按「当时激活的分区」钉死了 —— 等第一条
+      // QQ 消息带着 source.kind='qq' 进来，bindIfNew 已经无动于衷，bot 专区的
+      // 锁定整个被跳过。实测症状：换局之后一整天的 QQ 记忆全进了桌面端那个分区，
+      // 而面板还在说「锁在 private」。
+      // 现在只在 user/message 上绑 —— 那是唯一带得动 source 的事件。
+      if (event?.type === 'user/message') bindSessionIfNew(id, event?.data?.source);
       const s = stateOf(id);
 
       if (event?.type === 'user/message') {
@@ -2023,6 +2065,9 @@ export function apply(ctx, rawConfig) {
       // 冻结的（改了容易让模型开口解释），所以这一层只能加在这里。
       '只输出 JSON 数组。数组里每个对象的键只能是 ts、weight、zone、title、detail、keywords；不得出现 content、type、text、session、time 等其它键。',
       '正文放 detail（≤200 字），一句话概括放 title（≤40 字）；weight 用 0~1 的小数（如 0.5，别用 3、8 这种满分制）；zone 只能是 short、long、permanent。',
+      // 2026-10-28 加：记忆是「她读给自己看的」，写成第三人称（"对方""用户""她"）以后，
+      // 注入进上下文，她说话也跟着站到外面变成旁白。人称错了，人格文档压不住。
+      'title 和 detail 一律用第一人称「我」写，他称「他」；不要出现「对方」「用户」「她」这类第三人称指代。',
     ].join('\n');
   }
 
@@ -3320,11 +3365,14 @@ export function apply(ctx, rawConfig) {
         configured: config.botSpaceEnabled === true,
         reason: (() => {
           if (!botPluginPresent()) return '';
-          const sp = typeof config.botSpaceId === 'string' ? config.botSpaceId.trim() : '';
+          // 2026-10-28 修：这里原来读 `config.botSpaceId`（profile yml 里的空值），
+          // 而真正生效的是 bot-space.json 里钉死的那个。结果面板永远显示
+          // 「还没填分区 id —— 专区还没生效」，实际上早就锁好了 —— 一句假警告。
+          const sp = botSpaceId();
           if (sp === '') {
             return '检测到 dsh-qq-bot 正在运行：开关已锁定为开启，但还没填分区 id —— 专区还没生效，填一个分区才会真正分开存。（不允许关闭，除非先卸载 Qbot 插件）';
           }
-          return '检测到 dsh-qq-bot 正在运行：这个开关被锁定为开启，不允许关闭。请先卸载 Qbot 插件，再回来关它。';
+          return '检测到 dsh-qq-bot插件：这个开关不允许关闭。请卸载 Qbot 插件后再尝试。';
         })(),
       },
       // 分区体检：谁炸了、镜像里有没有备份
@@ -3512,6 +3560,39 @@ export function apply(ctx, rawConfig) {
               if (req.method !== 'GET') return reply(res, 405, { ok: false, error: '只支持 GET' });
               await loadPromise;
               return reply(res, 200, panelState(queryOf(req)));
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
+          /**
+           * 只读：**这个会话**的记忆存在哪个分区。
+           *
+           * 给对话页底部那条「脑子：私生活」小标签用（2026-10-28 加的）。
+           * 这里**故意只有 GET，没有任何写入口** —— 改分区是面板的事
+           * （侧栏 → 记忆 → 当前记忆分区），两个地方都能改就会有两套说法。
+           */
+          kind: 'exact',
+          path: `${PANEL_BASE}/session-space`,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'GET') return reply(res, 405, { ok: false, error: '只支持 GET' });
+              await loadPromise;
+              const sessionId = String(
+                new URL(String(req?.url ?? '/'), 'http://localhost').searchParams.get('session') ?? '',
+              ).trim();
+              if (sessionId === '') return reply(res, 400, { ok: false, error: '缺 session' });
+              const spaceId = String(spaceIdOfSession(sessionId) || activeSpaceId);
+              const hit = (spaceInfo.spaces ?? []).find((sp) => sp.id === spaceId);
+              // 只报分区，不报「这是不是 Qbot 专区」—— 那句话是面板里给用 Qbot 的人看的，
+              // 不该出现在正常干活的对话页底（2026-10-28 他说的）。
+              return reply(res, 200, {
+                ok: true,
+                sessionId,
+                spaceId,
+                spaceName: hit?.name ?? spaceId,
+              });
             } catch (err) {
               return fail(res, 500, err);
             }
