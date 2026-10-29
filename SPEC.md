@@ -464,12 +464,27 @@ export function apply(ctx, rawConfig) { … }
    按 `(sessionId, turn)` 缓存渲染结果。
 8. 工具（`ctx.inject(['tools'], scope => scope.effect(() => scope.tools.register({…}), '…'))`）：
    - `memory_search`：`{ query, top? }` → 跨区关键词查找，返回命中条目（**只取这几条**）
-   - `memory_stats`：三区容量
+   - `memory_stats`：三区容量（四行容量 + 合计 + 上次固化 + 分区，共 6 行）
+
+   **两只工具都跟着调用它的会话走**：会话绑哪个分区就查哪个（`exec.agent.id` →
+   `spaceIdOfSession`）。子代理 / fork 出来的会话自己不绑定、也不写记忆，它们
+   **继承派它的那一局**的分区（沿 `session.header.parentSession` 往上找最近一个有绑定的
+   祖先）。拿不到会话、或这一整条链都没绑定时才跟随「当前激活分区」，而且工具不落绑定
+   —— 钉分区只由第一句人话决定。输出里写明读的是哪个分区（继承来的会标
+   「继承派它的那一局」），面板的 active 与会话绑定不一致时能当场看出来。
+
    参数用**手写 JSON Schema**（不能 import `@deepseek-ai/dsh-tools`）。
 9. HTTP（`ctx.inject(['webServer'], …)` + `scope.webServer.register({ kind:'exact', path, handler })`）：
-   - `GET  /ebbinghaus/state`   三区容量 + 全库 token 总量 + 设置字段表 + 最近条目 + 检索结果（带 `?q=`）
+   - `GET  /ebbinghaus/state`   三区容量 + 全库 token 总量 + 设置字段表 + 最近条目 + 检索结果（带 `?q=`），
+     外加 `spaceProblems` / `spacesDegraded`：注册表**自己**读不懂时（比如被加了 BOM），
+     分区会静默塌成单个，这两个字段负责把这件事摆到面板上，别再让「分区体检」说一切正常
    - `GET  /ebbinghaus/settings` 可调字段表（当前值 / 边界 / 底座值）
    - `POST /ebbinghaus/settings` `{ key: value, … }` 或 `{ reset: true }` → 落 settings.json 并当场生效
+   > **读类 vs 写类**：`GET /state`、`GET /settings` 在 `usingSpace(activeSpaceId, …)` 里求值，
+   > 固化进行中也不会跟着 `opSpaceId` 跑到别的分区；`forget` / `harvest` / `compress` /
+   > `dedup` / `reclaim` / `export` / `mirror` / `reload` 是异步的、依赖全局 `store` 代理，
+   > 所以固化期间一律回 `409 { ok:false, error:'正在固化……' }`。切分区（`/spaces/*`）
+   > 不碰代理，不受影响。
    - `POST /ebbinghaus/forget`  `{ id }` 删一条
    - `POST /ebbinghaus/harvest` 手动跑一次到期收割
    - `POST /ebbinghaus/compress` `{ zone }` 手动压缩一次
@@ -489,10 +504,31 @@ export function apply(ctx, rawConfig) { … }
     `dedup-state.json` 里的 `entriesSinceCheck`，满 `dedupEveryEntries` 就按
     `runDedupNow({trigger:'auto'})` 跑一次。**必须走同一个串行队列**（和固化一样），
     两边都在改 store，并发写会互相覆盖。
-13. **自检进度必须落盘**（`<dataDir>/dedup-state.json`）。只存内存的话每次重启归零，
+13. **自检进度必须落盘，而且按分区各一份**（`<dataDir>/dedup-state.json`，
+    多分区下就是 `spaces/<id>/dedup-state.json`）。只存内存的话每次重启归零，
     「每 30 条一次」会变成「每 30 条，或者每次重开 DSH 后第一次写记忆」。
+    **不能是单份全局**：它是绑定 `dataDir` 的，而 `dataDir` 跟着 active 变 ——
+    单份全局时切一次分区就把 A 的进度写进 B 的文件，`totalGroups`/`totalMerged` 还会互相叠加。
+    账记在「这次入库落在哪个分区」上（`currentSpaceId()`），面板显示 active 那本。
 14. **手动触发不受 `dedupEnabled` 拦**：面板上「立刻自检」按钮点了就该有反应，
     开关管的是「自动跑不跑」。
+15. **删分区是「真删」，且有三条硬规矩**（2026-10-29 他定的）：
+    ① **Qbot 指定分区不许删** —— 删了 QQ 记忆就没地方去；
+    ② **删完必须至少还剩一个「非 Qbot 分区」** —— 新会话仍落到 active，只剩 QQ 专区时
+       新会话会写进 QQ 库；
+    ③ 挂在被删分区上的会话**变成「未挂载」**（`bindings[sid] = ''`）：
+       **不回落 active**，注入整段不出、固化跳过、两只工具直接说「去挑一个分区」，
+       直到用户在小标签里挂回去为止。
+    删的是 active → 自动切到「剩下的非 Qbot 分区里**最新创建**的那个」。
+    镜像里那份会留着当救命稻草，但会在 `<mirrorDir>/<id>/` 写一个 `._deleted.json`：
+    `recoverFromMirror()` 见到它一律拒绝自动恢复，防止「删掉之后新建同名分区、旧记忆自己爬回来」。
+16. **BOT 分区锁**（`bot-space.json` 的 `lockForeign`，**默认开**）：打开后**其他对话不能读写
+    Qbot 专区** —— 桌面新会话不落进去（哪怕 active 指着专区，改落非 bot 里最新创建的那个）、
+    手动挂载被 400 拒、已经挂着的非 QQ 会话打成「未挂载」。QQ 会话照旧，靠「发来过 bridged
+    人话（kind 在 `sourceKinds` 白名单里）」认出来并记进同文件的 `sessions`；
+    **只认人话来源**，系统注入 / 插件派活不算（否则会拆掉「注入不许改绑」那条）。
+    锁生效要求：装了 qq-bot + 选了专区 + 那个分区仍在 —— 缺一条就不生效、不报错。
+    active 允许指向专区（仅查看），面板的管理入口（浏览/导出/体检/恢复）不受限制。
 
 ---
 

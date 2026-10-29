@@ -92,7 +92,7 @@ export function isSafeMirrorDir(mirrorDir, dataDir) {
   const d = String(dataDir ?? '').trim()
   if (m === '') return { ok: false, reason: '镜像目录没填' }
   if (!path.isAbsolute(m) && !/^[A-Za-z]:[\\/]/.test(m) && !m.startsWith('\\\\')) {
-    return { ok: false, reason: '镜像目录必须是绝对路径（比如 D:\\DSH\\mirror）' }
+    return { ok: false, reason: '镜像目录必须是绝对路径（比如 D:\\Backups\\memory）' }
   }
   if (d === '') return { ok: false, reason: '记忆库目录为空，没法比' }
   const mn = path.resolve(m).toLowerCase().replace(/[\\/]+$/, '')

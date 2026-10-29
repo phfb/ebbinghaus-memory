@@ -25,6 +25,7 @@
 
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -41,9 +42,9 @@ import { resolveConfig } from '../src/core/config.mjs';
 import { daysBetween, fullStamp, stampFor } from '../src/core/time.mjs';
 
 // ── 源目录 ────────────────────────────────────────────────────────────────
-// 默认值就是这台机器的真实位置；允许用环境变量搬走，换电脑时不用改代码。
-const DSH_HOME = process.env.DSH_HOME || 'D:/DSH/dsh-home';
-const FEIYU_HOME = process.env.FEIYU_HOME || 'D:/DSH/feiyu-diary';
+// 不写死任何本机路径：默认按「家目录/DSH/dsh-home」猜，换电脑/换布局用环境变量覆盖。
+const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), 'DSH', 'dsh-home');
+const FEIYU_HOME = process.env.FEIYU_HOME || path.join(os.homedir(), 'DSH', 'feiyu-diary');
 const PROFILE_WS = path.join(
   DSH_HOME,
   'profiles',
@@ -795,7 +796,7 @@ function printHelp() {
 选项
   --apply                 真的写盘（写前自动备份到 <库目录>/_backup-<YYYYMMDD-HHmmss>/）
   --dir <path>            目标记忆库目录
-                          默认 $DSH_HOME/ebbinghaus-memory，再退回 D:/DSH/dsh-home/ebbinghaus-memory
+                          默认 $DSH_HOME/ebbinghaus-memory，再退回 <家目录>/DSH/dsh-home/ebbinghaus-memory
   --short-days <n>        覆盖短期周期（默认读 config 的 7）
   --long-days <n>         覆盖长期周期（默认读 config 的 28）
   --verbose, -v           逐条打印标题与去向
@@ -814,7 +815,7 @@ function resolveDataDir(cliDir) {
   if (typeof cliDir === 'string' && cliDir.trim() !== '') return path.resolve(cliDir.trim());
   const home = (process.env.DSH_HOME ?? '').trim();
   if (home !== '') return path.join(home, 'ebbinghaus-memory');
-  return path.join('D:/DSH/dsh-home', 'ebbinghaus-memory');
+  return path.join(os.homedir(), 'DSH', 'dsh-home', 'ebbinghaus-memory');
 }
 
 /**

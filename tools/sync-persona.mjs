@@ -4,7 +4,8 @@
  * 用户的原话：「所有人格以永久记忆区为准，你把永久记忆区的人格复制上去」。
  *
  * 所以真相源是 ebbinghaus 库永久区里那 6 条「人格·xxx」，
- * `D:\DSH\dsh-home\AGENT.md` 是它们的一份**可注入副本**（dsh-agent-md 读它）。
+ * `<dsh-home>/AGENT.md` 是它们的一份**可注入副本**（dsh-agent-md 读它）。
+ * 两个路径都走环境变量：`EB_LIB_DIR` / `EB_PERSONA_FILE`（见下面常量）。
  *
  * 这个脚本做两件事：
  *   1. 从库里读出 6 条「人格·」，按原顺序拼成 Markdown，写进 AGENT.md
@@ -20,13 +21,21 @@
  */
 
 import { promises as fsp } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import { createStore } from '../src/core/store.mjs';
 
 const APPLY = process.argv.includes('--apply');
-const DIR = 'D:/DSH/dsh-home/ebbinghaus-memory';
-const TARGET = 'D:/DSH/dsh-home/AGENT.md';
+/**
+ * 库目录 / 人格文件位置：**不写死本机路径**，用环境变量覆盖，没设就按家目录猜。
+ *
+ *   EB_LIB_DIR        记忆库目录（默认 <家目录>/DSH/dsh-home/ebbinghaus-memory）
+ *   EB_PERSONA_FILE   要写的人格文件（默认 <家目录>/DSH/dsh-home/AGENT.md）
+ */
+const HOME = os.homedir();
+const DIR = process.env.EB_LIB_DIR || path.join(HOME, 'DSH', 'dsh-home', 'ebbinghaus-memory');
+const TARGET = process.env.EB_PERSONA_FILE || path.join(HOME, 'DSH', 'dsh-home', 'AGENT.md');
 
 /** 永久区里哪些标题算「人格」。顺序就是写进 AGENT.md 的顺序。 */
 const PERSONA_TITLES = [
@@ -138,7 +147,7 @@ const HEADER = `<!--
 3. 改完想把「永久记忆区」也同步回这个版本 —— 反过来手动改库里那 9 条
    「人格·xxx」，再跑：node tools/sync-persona.mjs --apply
 
-【真相源】D:\\DSH\\dsh-home\\ebbinghaus-memory\\permanent.jsonl 里 9 条「人格·」
+【真相源】${DIR}/permanent.jsonl 里 9 条「人格·」
           （weight 0.1，只存不注入；内容已在本文件里，注入走本文件）
 【注入源】本文件。dsh-agent-md 每回合读它，改完下一回合生效，不用重启。
 【别做的事】别在这里写双花括号的模板变量，宿主会当变量解析失败；
@@ -226,4 +235,4 @@ const perm = [...store.zones.permanent].sort(
 console.log('\n永久区前 8 条（重启后 loadPermanentCount=6 会取前 6）：');
 perm.slice(0, 8).forEach((e, i) => console.log(`  ${i + 1}. w=${e.weight}  ${String(e.title).slice(0, 40)}`));
 console.log(`\n人格真相源：永久区那 ${found.length} 条「人格·」（weight ${DEMOTE_TO}，只存不注入）`);
-console.log('人格注入源：D:\\DSH\\dsh-home\\AGENT.md（dsh-agent-md 每回合读它）');
+console.log('人格注入源：' + TARGET + '（dsh-agent-md 每回合读它）');

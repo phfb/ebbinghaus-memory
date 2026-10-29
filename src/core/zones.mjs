@@ -222,7 +222,7 @@ export function digestDropped(droppedList, cfg, now) {
     title: `那阵子：${titles[0] ?? '一些零碎的事'}`.slice(0, 80),
     detail:
       `（这段日子有 ${list.length} 件事已经记不清细节，只剩下一个大概印象：` +
-      `${titles.join('；') || '和他在忙些事情'}。）`,
+      `${titles.join('；') || '和你在一起忙些事情'}。）`,
     keywords: [],
     source: 'merge',
     depth: Math.min(9, baseDepth + 1),

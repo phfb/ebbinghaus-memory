@@ -62,11 +62,14 @@ test('renderInjection：文本形状照 SPEC §11，空区整段不出现', () =
   assert.equal(lines[0], '<ebbinghaus-memory>');
   assert.equal(lines[1], '你的记忆按遗忘曲线分三层。时间戳是事件发生的时间，不是你现在的时间。');
   assert.equal(lines[2], '不要凭空补全这里没有的事。');
-  assert.equal(lines[3], '');
-  assert.equal(lines[4], '〔短期 · 最近 7 天〕');
-  assert.ok(lines[5].startsWith('- [10-25 11:00] 他在做 DSH 记忆插件 —— '), lines[5]);
-  assert.ok(lines[5].endsWith(' · 0.72'), lines[5]);
-  assert.ok(lines[6].startsWith('- ['), lines[6]);
+  // 2026-10-29：多了一行人称硬映射（「我」=她自己，「你」=对面那个人）。
+  assert.ok(lines[3].includes('「我」是你自己'), lines[3]);
+  assert.ok(lines[3].includes('老条目里写成「他」的'), lines[3]);
+  assert.equal(lines[4], '');
+  assert.equal(lines[5], '〔短期 · 最近 7 天〕');
+  assert.ok(lines[6].startsWith('- [10-25 11:00] 他在做 DSH 记忆插件 —— '), lines[6]);
+  assert.ok(lines[6].endsWith(' · 0.72'), lines[6]);
+  assert.ok(lines[7].startsWith('- ['), lines[7]);
   assert.equal(lines[lines.length - 1], '</ebbinghaus-memory>');
 
   // 空区不出现，也不写「（空）」

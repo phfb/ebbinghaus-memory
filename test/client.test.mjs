@@ -832,7 +832,7 @@ test('client: 镜像目录是字符串字段，填路径照样能保存（不会
   assert.equal(box.props.type, 'text');
 
   // 关键：一次保存里混着数字和路径 —— 正是用户踩到的那一下
-  box.props.onChange({ target: { value: 'E:\\DSHmemoryBackup' } });
+  box.props.onChange({ target: { value: 'E:\\Backups\\memory' } });
   tree = renderNow(panel, react);
   labeled(tree, '全库总量上限（token，渲染口径，最多 30 万）').props.onChange({ target: { value: '200000' } });
   tree = renderNow(panel, react);
@@ -843,7 +843,7 @@ test('client: 镜像目录是字符串字段，填路径照样能保存（不会
   const post = calls.find((c) => c.method === 'POST' && c.url.endsWith('/ebbinghaus/settings'));
   assert.ok(post, '整次保存不能被路径字段吞掉');
   const body = JSON.parse(post.body);
-  assert.equal(body.mirrorDir, 'E:\\DSHmemoryBackup', '路径要原样当字符串发出去，不能过 Number()');
+  assert.equal(body.mirrorDir, 'E:\\Backups\\memory', '路径要原样当字符串发出去，不能过 Number()');
   assert.equal(body.totalTokenCapacity, 200000, '同一批里的数字字段照旧生效');
 });
 
@@ -851,13 +851,13 @@ test('client: 镜像目录清空也要能存下去（"留空 = 不备份"是正�
   const react = makeStubReact();
   const { panel, calls } = mount({
     react,
-    fetchImpl: okFetch(tokenPayloadWithMirrorDir('E:\\DSHmemoryBackup')),
+    fetchImpl: okFetch(tokenPayloadWithMirrorDir('E:\\Backups\\memory')),
   });
   let tree = await renderSettled(panel, react, 1);
   tree = await clickAndSettle(panel, react, buttonByText(tree, '展开'));
 
   const box = labeled(tree, MIRROR_LABEL);
-  assert.equal(box.props.value, 'E:\\DSHmemoryBackup', '原来的值得显示出来');
+  assert.equal(box.props.value, 'E:\\Backups\\memory', '原来的值得显示出来');
   box.props.onChange({ target: { value: '' } });
   tree = renderNow(panel, react);
   tree = await clickAndSettle(panel, react, buttonByText(tree, '保存'));

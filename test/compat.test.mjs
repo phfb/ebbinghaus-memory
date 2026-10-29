@@ -43,7 +43,7 @@ test('toZone 把语义词映射到三区，认不出来就交给 weight', () => 
 test('canonicalizeEntry 认得模型那套 type/content/session 写法', () => {
   const raw = {
     type: 'config',
-    content: '桌面端记忆插件的 mirror 目录指向 D:/DSH/dsh-home/ebbinghaus-mirror',
+    content: '桌面端记忆插件的 mirror 目录指向 D:/path/to/ebbinghaus-mirror',
     session: 'probe-session',
     ts: 1793086189781,
   };

@@ -1199,6 +1199,8 @@ window.__ModuleLoader__.load({
       const [info, setInfo] = useState(null);
       const [open, setOpen] = useState(false);
       const [failed, setFailed] = useState(false);
+      /** 正在把这一局挂到某个分区上（按钮循环点击用） */
+      const [mounting, setMounting] = useState(false);
 
       // 拉一次这个会话的分区。点开时再拉一次 —— 同一个会话中途被改绑（只有 bot
       // 专区会这样）也能当场看到，不用等切换会话。没有轮询：一个只读标签不值一个定时器。
@@ -1248,6 +1250,11 @@ window.__ModuleLoader__.load({
       const spaceId = typeof info.spaceId === 'string' ? info.spaceId : '';
       const spaceName = typeof info.spaceName === 'string' && info.spaceName !== '' ? info.spaceName : spaceId;
       const where = spaceId !== '' && spaceName !== spaceId ? `${spaceName}（${spaceId}）` : spaceName;
+      // 未挂载：原来那个分区被删掉了。这时候要给他一个「选一个分区挂上去」的入口 ——
+      // 只有这一种情况标签是可操作的，平时仍然是只读（改分区统一在侧栏「记忆」里改）。
+      const unmounted = info.unmounted === true;
+      const choices = Array.isArray(info.spaces) ? info.spaces : [];
+      const label = unmounted ? '未挂载' : spaceName;
 
       return h(
         'div',
@@ -1257,8 +1264,12 @@ window.__ModuleLoader__.load({
           {
             type: 'button',
             // 只放图标（2026-10-28 他要求）：文字会把 dock 撑长，分区名点开才看。
-            title: `当前会话记忆分区：${spaceName}`,
-            'aria-label': `当前会话的记忆分区：${spaceName}`,
+            title: unmounted
+              ? '这一局还没挂记忆分区（原来那个分区被删了）：点这里选一个'
+              : `当前会话记忆分区：${spaceName}`,
+            'aria-label': unmounted
+              ? '这一局还没挂记忆分区：点这里选一个分区'
+              : `当前会话的记忆分区：${spaceName}`,
             'aria-expanded': open ? 'true' : 'false',
             onClick: (e) => {
               if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
@@ -1283,7 +1294,7 @@ window.__ModuleLoader__.load({
           },
           h(BrainIcon, { size: 14 }),
           // 图标后面只跟「：分区名」——「脑子」两个字他让删掉（2026-10-28）。
-          `：${spaceName}`,
+          `：${label}`,
         ),
         open
           ? h(
@@ -1313,17 +1324,69 @@ window.__ModuleLoader__.load({
                 },
               },
               h('div', { style: { color: C.text1, marginBottom: 6 } }, '当前会话记忆分区'),
-              h('div', null, `当前会话记忆存在：${where}`),
-              h(
-                'div',
-                { style: { marginTop: 6, fontSize: 11, color: C.text2 } },
-                '若要修改，请前往侧边栏「记忆」里改分区。',
-              ),
-              h(
-                'div',
-                { style: { marginTop: 4, fontSize: 11, color: C.text2 } },
-                '记忆分区跟随首次对话选择，无法再次切换。',
-              ),
+              unmounted
+                ? h(
+                    'div',
+                    null,
+                    h(
+                      'div',
+                      { style: { color: C.err, marginBottom: 6 } },
+                      '原来那个分区被删了，这一局现在不读写记忆。选一个分区挂上去就恢复：',
+                    ),
+                    h(
+                      'div',
+                      { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+                      ...choices.map((s) =>
+                        h(
+                          'button',
+                          {
+                            key: `mount-${s.id}`,
+                            type: 'button',
+                            onClick: (e) => {
+                              if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+                              if (mounting) return;
+                              setMounting(true);
+                              postJson('/spaces/bind', { sessionId, id: s.id })
+                                .then(() => {
+                                  setMounting(false);
+                                  setOpen(false);
+                                  load();
+                                })
+                                .catch(() => setMounting(false));
+                            },
+                            disabled: mounting,
+                            style: {
+                              textAlign: 'left',
+                              padding: '5px 9px',
+                              border: `1px solid ${C.border1}`,
+                              borderRadius: 8,
+                              background: 'transparent',
+                              color: C.text1,
+                              font: 'inherit',
+                              fontSize: 12,
+                              cursor: mounting ? 'default' : 'pointer',
+                            },
+                          },
+                          `挂到 ${s.name}（${s.id}）`,
+                        ),
+                      ),
+                    ),
+                  )
+                : h(
+                    'div',
+                    null,
+                    h('div', null, `当前会话记忆存在：${where}`),
+                    h(
+                      'div',
+                      { style: { marginTop: 6, fontSize: 11, color: C.text2 } },
+                      '若要修改，请前往侧边栏「记忆」里改分区。',
+                    ),
+                    h(
+                      'div',
+                      { style: { marginTop: 4, fontSize: 11, color: C.text2 } },
+                      '记忆分区跟随首次对话选择，无法再次切换。',
+                    ),
+                  ),
             )
           : null,
       );
@@ -1585,6 +1648,38 @@ window.__ModuleLoader__.load({
       /** bot 专区的提示 + 分区体检的提示 */
       const [botNotice, setBotNotice] = useState('');
       const [botPick, setBotPick] = useState('');
+      /** BOT 分区锁正在提交 */
+      const [botLockBusy, setBotLockBusy] = useState(false);
+
+      /**
+       * BOT 分区锁开关（默认开）。
+       *
+       * 只在**检测到 Qbot 插件**时才渲染（他要求：检测到 Bot 才激活这些设置）——
+       * 新装的库、或者根本不跑 Bot 的人，这一整块都不出现，也不会牵动任何逻辑。
+       */
+      function setBotLock(locked) {
+        if (botLockBusy) return;
+        setBotLockBusy(true);
+        postJson('/bot-lock', { locked: Boolean(locked) })
+          .then((r) => {
+            setBotLockBusy(false);
+            if (r && r.ok === false) {
+              setBotNotice(String(r.error || '切换失败'));
+              return;
+            }
+            const moved = num(r.unmounted, 0);
+            setBotNotice(
+              locked
+                ? `BOT 分区锁已打开${moved > 0 ? `，${moved} 个非 QQ 会话已变成「未挂载」` : ''}`
+                : 'BOT 分区锁已关闭：其他对话又可以读写 Qbot 专区了',
+            );
+            reload();
+          })
+          .catch(() => {
+            setBotLockBusy(false);
+            setBotNotice('切换失败');
+          });
+      }
 
       /** 把 bot 专区钉死在某个分区（钉死后不可改）。 */
       function saveBotSpace() {
@@ -1721,8 +1816,10 @@ window.__ModuleLoader__.load({
             setSpaceOp(null);
             if (r && r.ok === false) {
               setSettingsNotice(`分区操作没成功：${r.error || '未知原因'}`);
-            } else if (op.mode === 'delete' && num(r.unbound, 0) > 0) {
-              setSettingsNotice(`已删掉，目录搬到 _trash；顺带解绑了 ${num(r.unbound, 0)} 个会话`);
+            } else if (op.mode === 'delete' && num(r.unmounted, 0) > 0) {
+              setSettingsNotice(
+                `已删掉（真删）。${num(r.unmounted, 0)} 个会话变成「未挂载」——去对话下面那个小标签里挑一个分区挂上，否则那几局不读写记忆`,
+              );
             }
             reload();
           })
@@ -1826,6 +1923,40 @@ window.__ModuleLoader__.load({
       const head = [`三层记忆 · 共 ${total} 条`, `短期 ${shortDays} 天 / 长期 ${longDays} 天`];
       if (tokenCap > 0) head.push(`总量 ${fmtTokens(tokenTotal)} / ${fmtTokens(tokenCap)} token`);
       if (typeof d.dir === 'string' && d.dir) head.push(d.dir);
+
+      /* 注册表自己的毛病 —— 和下面「分区体检」是两件事：
+         体检查的是「已注册的分区里谁炸了」，这里是「注册表压根没读懂」。
+         后者会让分区悄无声息地塌成一个，而体检那会儿还是空的（没分区可查），
+         于是面板会写「分区都读得出来，没问题」—— 2026-10-29 真踩过一次。
+         所以摆在页面最上面，别让它藏在日志里。 */
+      const spaceProblems = Array.isArray(d.spaceProblems)
+        ? d.spaceProblems.filter((x) => typeof x === 'string' && x.trim() !== '')
+        : [];
+      const spaceAlarm =
+        spaceProblems.length === 0 && d.spacesDegraded !== true
+          ? null
+          : h(
+              'div',
+              {
+                style: {
+                  marginTop: 12,
+                  padding: '10px 12px',
+                  border: `1px solid ${C.err}`,
+                  borderRadius: 8,
+                  background: C.layer1,
+                  color: C.err,
+                  fontSize: 12,
+                  lineHeight: 1.8,
+                },
+              },
+              h('div', { style: { fontWeight: 600 } }, '⛔ 分区注册表有问题，现在不是完整状态'),
+              ...spaceProblems.map((msg, i) => h('div', { key: `sp-problem-${i}` }, `· ${msg}`)),
+              h(
+                'div',
+                { style: { marginTop: 4, color: C.text2 } },
+                '插件会临时按「只有一个分区」继续跑：记忆一条都不会丢，但指向别的分区的会话会全部落到当前激活分区。把库根下出问题的那个 JSON 修好，再重启 DSH NEXT。',
+              ),
+            );
 
   /* 设置卡里那条「预计注入占用」要用的数据：各分区现有条数 + 每条平均 token。
      平均单价用「全库 token ÷ 全库条数」推，只做量级参考 —— 面板上会写明是估算。 */
@@ -2120,6 +2251,49 @@ window.__ModuleLoader__.load({
                 ),
               ],
         ),
+        // BOT 分区锁：**只在检测到 Qbot 插件时才出现**（没装就不激活这些设置）
+        botInfo.pluginPresent || botInfo.enabled
+          ? h(
+              'div',
+              {
+                style: {
+                  marginTop: 10,
+                  paddingTop: 10,
+                  borderTop: `1px solid ${C.border1}`,
+                  fontSize: 12,
+                  lineHeight: 1.8,
+                },
+              },
+              h(
+                'label',
+                { style: { display: 'flex', alignItems: 'center', gap: 8, color: C.text1, fontWeight: 600 } },
+                h('input', {
+                  type: 'checkbox',
+                  checked: botInfo.lockForeign !== false,
+                  disabled: botLockBusy,
+                  onChange: (e) => setBotLock(Boolean(e && e.target && e.target.checked)),
+                }),
+                'BOT 分区锁',
+                h(
+                  'span',
+                  { style: { fontSize: 11, color: C.text2, fontWeight: 400 } },
+                  botInfo.lockForeign !== false ? '（已打开）' : '（已关闭）',
+                ),
+              ),
+              h(
+                'div',
+                { style: { marginTop: 4, fontSize: 11, color: C.text2 } },
+                '打开后其他对话无法对它读写：桌面会话不会落进这个分区、也不能手动挂过来；已经挂在里面的会立刻变成「未挂载」，你在对话下面那个小标签里挑一个分区挂回去。QQ 那边不受影响，面板里照样能浏览 / 导出 / 体检 / 恢复。',
+              ),
+              botInfo.lockForeign !== false && botInfo.lockEffective === false
+                ? h(
+                    'div',
+                    { style: { marginTop: 4, fontSize: 11, color: C.text2 } },
+                    '（现在还没实际生效：要么没检测到 qq-bot，要么还没选「存到」哪个分区。）',
+                  )
+                : null,
+            )
+          : null,
         botNotice ? h('div', { style: { marginTop: 6, fontSize: 11, color: C.text2 } }, botNotice) : null,
       );
 
@@ -2306,6 +2480,8 @@ window.__ModuleLoader__.load({
                 ),
               ),
 
+          spaceAlarm,
+
           searchBar,
 
           h(
@@ -2321,6 +2497,8 @@ window.__ModuleLoader__.load({
             if (list.length === 0) return null;
             const cur = list.find((x) => x.id === sp.active) ?? list[0];
             const curName = cur ? cur.name : sp.active;
+            // Qbot 指定的那个分区不许删（host 侧也会拒，这里是提前把按钮禁掉）
+            const botLocked = Boolean(cur && cur.bot);
             const ago = (iso) => {
               if (!iso) return '空库';
               const t = Date.parse(String(iso));
@@ -2331,11 +2509,17 @@ window.__ModuleLoader__.load({
               if (min < 1440) return `${Math.floor(min / 60)} 小时前`;
               return `${Math.floor(min / 1440)} 天前`;
             };
-            const fmt = (s) =>
-              `${s.name}（短 ${num(s.counts && s.counts.short, 0)} · 长 ${num(s.counts && s.counts.long, 0)} · 永 ${num(
+            const fmt = (s) => {
+              // BOT 分区锁开着时，Qbot 专区在「当前记忆分区」里只能看、不能写：
+              // 标出来，免得他以为切过去新会话就会进这个库。
+              const botLockedHere =
+                Boolean(s.bot) && isObj(d.botSpace) && d.botSpace.lockEffective === true;
+              const tail = botLockedHere ? ' · Qbot 专区·锁定中（仅查看）' : '';
+              return `${s.name}（短 ${num(s.counts && s.counts.short, 0)} · 长 ${num(s.counts && s.counts.long, 0)} · 永 ${num(
                 s.counts && s.counts.permanent,
                 0,
-              )} · ${ago(s.lastActivityAt)}）`;
+              )} · ${ago(s.lastActivityAt)}）${tail}`;
+            };
             return h(
               'div',
               {
@@ -2378,11 +2562,11 @@ window.__ModuleLoader__.load({
               }, '改名'),
               h('button', {
                 type: 'button',
-                onClick: () =>
-                  setSpaceOp({ mode: 'delete', value: curName, id: sp.active }),
-                disabled: busy,
-                style: chipStyle(C.text2, busy),
-              }, '删除'),
+                onClick: () => setSpaceOp({ mode: 'delete', value: '', id: sp.active }),
+                disabled: busy || botLocked,
+                title: botLocked ? '这是 Qbot 指定的分区，不能删（删了 QQ 的记忆就没地方去了）' : '',
+                style: chipStyle(C.text2, busy || botLocked),
+              }, botLocked ? '删除（Qbot 专属，已锁）' : '删除'),
             );
           })(),
 
@@ -2399,11 +2583,91 @@ window.__ModuleLoader__.load({
                   },
                 },
                 spaceOp.mode === 'delete'
-                  ? h(
-                      'span',
-                      { style: { fontSize: 12, color: C.text2 } },
-                      `确认删掉「${spaceOp.value}」？整个目录会搬到 _trash，不真删`,
-                    )
+                  ? (() => {
+                      // 真删确认。四件事必须说清楚：条数、会话会不会改挂、删完 active 是谁、
+                      // 镜像里还留着哪份。另外要求手打分区名 —— 这一步不可逆。
+                      const cnt = (cur && cur.counts) || {};
+                      const total =
+                        num(cnt.short, 0) + num(cnt.long, 0) + num(cnt.permanent, 0);
+                      const bound = num(cur && cur.bindings, 0);
+                      // 删完 active 会切到「非 Qbot 分区里最新创建的那个」（host 侧同一套规则）
+                      const nextList = list
+                        .filter((x) => x.id !== spaceOp.id && !x.bot)
+                        .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+                      const nextActive = nextList[0] ? `${nextList[0].name}（${nextList[0].id}）` : '（没有可切的）';
+                      const mirrorDir = isObj(d.mirror) && typeof d.mirror.dir === 'string' ? d.mirror.dir : '';
+                      const typed = spaceOp.value === curName;
+                      return h(
+                        'div',
+                        {
+                          style: {
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: 6,
+                            marginBottom: 14,
+                            padding: '10px 12px',
+                            border: `1px solid ${C.err}`,
+                            borderRadius: 8,
+                            fontSize: 12,
+                            lineHeight: 1.9,
+                            color: C.err,
+                            background: C.layer1,
+                          },
+                        },
+                        h('div', { style: { fontWeight: 600 } }, `确认删掉「${curName}」？这一步是真删，删完不可恢复`),
+                        h(
+                          'div',
+                          { style: { color: C.text2 } },
+                          `这个分区里现有 ${total} 条记忆（短 ${num(cnt.short, 0)} / 长 ${num(cnt.long, 0)} / 永 ${num(cnt.permanent, 0)}），全部会跟着目录一起删掉。`,
+                        ),
+                        h(
+                          'div',
+                          { style: { color: C.text2 } },
+                          `挂在这个分区上的会话（${bound} 个）会变成「未挂载」：它们不会自动改写到别的分区，需要你在对话下面那个小标签里挑一个分区挂上去，在那之前那几局不读写记忆。`,
+                        ),
+                        h('div', { style: { color: C.text2 } }, `删完之后「当前记忆分区」会切到：${nextActive}`),
+                        mirrorDir !== ''
+                          ? h(
+                              'div',
+                              { style: { color: C.text2 } },
+                              `镜像里还留着一份备份：${mirrorDir}\\${spaceOp.id}（真要用得手动拷回来，不会自动灌回）`,
+                            )
+                          : null,
+                        h(
+                          'div',
+                          { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 4, flexWrap: 'wrap' } },
+                          h('input', {
+                            type: 'text',
+                            value: spaceOp.value,
+                            'aria-label': '输入分区名确认',
+                            placeholder: `手打「${curName}」确认`,
+                            onChange: (ev) =>
+                              setSpaceOp({ ...spaceOp, value: ev && ev.target ? String(ev.target.value) : '' }),
+                            style: { ...settingInputStyle(), minWidth: 200 },
+                          }),
+                          h(
+                            'button',
+                            {
+                              type: 'button',
+                              onClick: submitSpaceOp,
+                              disabled: busy === '分区' || !typed,
+                              style: chipStyle(C.err, busy === '分区' || !typed),
+                            },
+                            '确认删除',
+                          ),
+                          h(
+                            'button',
+                            {
+                              type: 'button',
+                              onClick: () => setSpaceOp(null),
+                              disabled: busy,
+                              style: chipStyle(C.text2, busy),
+                            },
+                            '取消',
+                          ),
+                        ),
+                      );
+                    })()
                   : h('input', {
                       type: 'text',
                       value: spaceOp.value,
@@ -2413,18 +2677,22 @@ window.__ModuleLoader__.load({
                         setSpaceOp({ ...spaceOp, value: ev && ev.target ? String(ev.target.value) : '' }),
                       style: { ...settingInputStyle(), minWidth: 200 },
                     }),
-                h('button', {
-                  type: 'button',
-                  onClick: submitSpaceOp,
-                  disabled: busy === '分区',
-                  style: chipStyle(C.brand, busy === '分区'),
-                }, spaceOp.mode === 'delete' ? '确认删除' : '确定'),
-                h('button', {
-                  type: 'button',
-                  onClick: () => setSpaceOp(null),
-                  disabled: busy,
-                  style: chipStyle(C.text2, busy),
-                }, '取消'),
+                spaceOp.mode === 'delete'
+                  ? null
+                  : h('button', {
+                      type: 'button',
+                      onClick: submitSpaceOp,
+                      disabled: busy === '分区',
+                      style: chipStyle(C.brand, busy === '分区'),
+                    }, '确定'),
+                spaceOp.mode === 'delete'
+                  ? null
+                  : h('button', {
+                      type: 'button',
+                      onClick: () => setSpaceOp(null),
+                      disabled: busy,
+                      style: chipStyle(C.text2, busy),
+                    }, '取消'),
               )
             : null,
 

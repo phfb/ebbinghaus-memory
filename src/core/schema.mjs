@@ -192,6 +192,24 @@ export function deriveKeywords(text, limit = 6) {
 }
 
 /**
+ * 人称漂移的机械修补：把「对方」「用户」换成「你」。
+ *
+ * 背景（2026-10-29）：条目约定是「我 = 我自己，你 = 对话对面那个人」。
+ * 可模型（尤其 flash 档）经常退回第三人称写「对方」「用户」。这两个词在
+ * 这个库里**没有第二种指代可能**，所以入库和读盘时直接换掉最稳，不靠提示词。
+ *
+ * 「他」「她」故意**不**机械换：它们可能真的是第三方（室友、同事、别的 AI）。
+ * 那一层交给两处兜底：① 固化/压缩提示词 ② 注入时那句硬映射
+ * （render.mjs 的 HEAD_LINES：「老条目里写成『他』的，指的就是『你』」）。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function sanitizeReferences(text) {
+  return String(text ?? '').replace(/对方/g, '你').replace(/用户/g, '你');
+}
+
+/**
  * 规整一条记忆。**不合格返回 null**（调用方丢弃，绝不写半成品）。
  *
  * @param {any} raw
@@ -222,8 +240,9 @@ export function normalizeEntry(raw, opts) {
   // 而这条路径只在 debugLog 打开时才可见（症状就是「用了半天一条没记上」）。
   // 正文从哪个键都能捞，是这里唯一该硬的地方；至于它叫什么名字，不该决定记忆的生死。
   const body = raw.content ?? raw.summary ?? raw.memo ?? raw.text;
-  const title = cleanText(raw.title ?? body ?? '', MAX_TITLE);
-  const detail = cleanText(raw.detail ?? body ?? '', MAX_DETAIL);
+  // 2026-10-29：入库/读盘统一把「对方」「用户」拧成「你」（见 sanitizeReferences）。
+  const title = cleanText(sanitizeReferences(raw.title ?? body ?? ''), MAX_TITLE);
+  const detail = cleanText(sanitizeReferences(raw.detail ?? body ?? ''), MAX_DETAIL);
   if (title === '' && detail === '') return null;
 
   const keywords = normalizeKeywords(raw.keywords ?? raw.tags);

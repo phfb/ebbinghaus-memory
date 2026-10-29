@@ -69,6 +69,7 @@ import {
   planLegacyMigration,
   BINDINGS_FILE,
   bindIfNew,
+  isAnchored,
   isValidSpaceId,
   makeSpaceId,
   normalizeSpaceName,
@@ -189,6 +190,30 @@ const MAX_MESSAGE_CHARS = 1200;
  */
 const DEFAULT_SOURCE_KINDS = Object.freeze(['user', 'qq']);
 /**
+ * 「这不是他说的，是 harness 自己塞进来的」那一类来源种类。
+ *
+ * DSH 在他说完一句话之后，会紧接着追发几条 `user/message` 事件：
+ * `runtime-context`（工作目录 / 权限 / 时间快照）、`skill-catalog`（技能清单）、
+ * `time-context`（时间）。事件类型和真消息一样，来源种类不同。
+ *
+ * 这张表只有一个用途：**别把它们当成外接桥接（QQ 之类）**。
+ * 判错的后果很具体 —— 它们会命中 bot 记忆专区，把会话刚钉好的分区当场改走
+ * （2026-10-29 实测：一句话说完 6 秒内注入从 workspace 变 private）。
+ *
+ * 用「列举已知种类」而不是「只认白名单」：社区接的桥接种类千奇百怪
+ * （telegram / discord / 各种自建），白名单会把它们全挡在专区外面；
+ * 列已知的内部种类，未知的一律按桥接处理，向后兼容。
+ * 将来 DSH 再加新的内部种类，这张表会漏 —— 所以 `bindSessionIfNew()` 里
+ * 还有第二道防线（不是人话就没有改绑资格），漏了也捅不破。
+ */
+const INTERNAL_SOURCE_KINDS = Object.freeze([
+  'runtime-context',
+  'skill-catalog',
+  'time-context',
+  'system',
+  'subagent',
+]);
+/**
  * 认定「这次固化算失败」的结果码 —— 用来累计连续失败次数。
  * `nothing-worth`（模型判断不值得记）和 `ok` 不算失败：那是正常工作。
  */
@@ -234,6 +259,15 @@ const SETTINGS_FILE = 'settings.json';
 const DEDUP_STATE_FILE = 'dedup-state.json';
 /** 镜像同步进度（落在库目录）。和自检那个同一个理由：不落盘就会每次重启归零。 */
 const MIRROR_STATE_FILE = 'mirror-state.json';
+
+/**
+ * 镜像里那个「这个分区已经被删掉了」的标记文件名（放在 `<mirrorDir>/<spaceId>/` 下）。
+ *
+ * 为什么要有：镜像目录是按 spaceId 命名的。分区真删之后镜像里那份会留着当救命稻草，
+ * 但**以后新建一个同名分区**时，`recoverFromMirror()` 会把旧记忆当成新分区的备份灌进去
+ * —— 删掉的记忆自己爬回来。有这个标记就一律拒绝自动恢复，只留手动捞。
+ */
+const DELETED_MARKER_FILE = '._deleted.json';
 
 /** 总量回收一次最多压几轮。防配置异常时死循环。 */
 const TOTAL_RECLAIM_MAX_ROUNDS = 24;
@@ -295,6 +329,27 @@ function countJsonlLines(file) {
   } catch {
     return 0;
   }
+}
+
+/**
+ * 读配置类 JSON：**先去掉可能存在的 BOM 再 parse**。
+ *
+ * 为什么：PowerShell 的 `Set-Content -Encoding utf8`、记事本、各种编辑器都会在
+ * 文件头写一个 `EF BB BF`。`JSON.parse` 见到它直接抛 `Unexpected token`，而
+ * 库根那几个文件（spaces.json / space-bindings.json / settings.json /
+ * bot-space.json 都是「允许手改」的）一旦这样，插件就只能走兜底分支 ——
+ * 2026-10-29 真发生过一次：spaces.json 被加了个 BOM，注册表整份没读进来，
+ * 分区塌成「只有 private」，所有指向别的分区的绑定当场失效，而面板上
+ * 「分区体检」还写着「分区都读得出来，没问题」。
+ *
+ * **只削掉开头那一个 U+FEFF，其余一个字节都不动** —— 没有 BOM 的文件行为完全不变。
+ *
+ * @param {string} text
+ * @returns {any}
+ */
+function parseJsonText(text) {
+  const s = typeof text === 'string' ? text : String(text ?? '');
+  return JSON.parse(s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 }
 
 /**
@@ -395,7 +450,7 @@ function ensureSpaces(root, log = () => {}, warn = () => {}) {
     let registry;
     if (existsSync(regPath)) {
       try {
-        const parsed = parseRegistry(JSON.parse(readFileSync(regPath, 'utf8')));
+        const parsed = parseRegistry(parseJsonText(readFileSync(regPath, 'utf8')));
         registry = parsed.registry;
         out.problems.push(...parsed.problems);
       } catch (err) {
@@ -453,7 +508,7 @@ function readSettingsOverrides(dir, warn) {
     if (!existsSync(p)) return {};
     const text = readFileSync(p, 'utf8');
     if (text.trim() === '') return {};
-    const raw = JSON.parse(text);
+    const raw = parseJsonText(text);
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {};
     return /** @type {Record<string, any>} */ (raw);
   } catch (err) {
@@ -739,8 +794,40 @@ export function apply(ctx, rawConfig) {
   /**
    * 自检进度。**必须落盘**：只存内存的话每次重启都归零，
    * 「每 30 条自检一次」会变成「每 30 条，或者每次重开 DSH 后第一次写记忆」。
+   *
+   * 2026-10-29 修：原来是**单份全局**，只在启动时从 `dataDir`（= 当时的 active）
+   * 读一次，之后永远写回 `dataDir` —— 而 `dataDir` 跟着 active 变。于是切一次分区，
+   * 另一个分区的进度就被写进这个分区的文件里。
+   * 实测证据：private 和 workspace 两个 `dedup-state.json` 除了 `entriesSinceCheck`
+   * 全同（lastChecked=450 / totalGroups=115 / totalMerged=126），两个独立库不可能一样。
+   *
+   * 现在按分区各记一份，key 就是分区 id；第一次用到才读盘。
+   *
+   * @type {Map<string, ReturnType<typeof emptyDedupState>>}
    */
-  let dedupState = readDedupState(dataDir, earlyWarn);
+  const dedupStates = new Map();
+
+  /** 某个分区的目录 —— 和 `realStoreOf()` 同一套规矩：active 那份走 dataDir。 */
+  function dirForSpace(spaceId) {
+    const sid = String(spaceId || activeSpaceId);
+    return sid === activeSpaceId ? dataDir : spaceDirOf(libraryRoot, sid);
+  }
+
+  /** 此刻「正在操作」的分区：固化期间是那个会话的分区，平时是 active。 */
+  function currentSpaceId() {
+    return String(opSpaceId ?? activeSpaceId);
+  }
+
+  /** 某个分区的自检进度（惰性读盘，读不到就是全零）。 */
+  function dedupStateOf(spaceId) {
+    const sid = String(spaceId || activeSpaceId);
+    let st = dedupStates.get(sid);
+    if (st === undefined) {
+      st = readDedupState(dirForSpace(sid), earlyWarn);
+      dedupStates.set(sid, st);
+    }
+    return st;
+  }
 
   /* 分区账本攒下的问题，等 config 初始化完再播报（ensureSpaces 那会儿调 warn 会踩 TDZ）。 */
   for (const msg of spaceInfo.problems) warn(`分区：${msg}`);
@@ -824,16 +911,29 @@ export function apply(ctx, rawConfig) {
   /** 会话 → 分区 的绑定表。钉住就不动 —— 旧会话不会被后来的切换抢走。 */
   /** @type {Record<string, string>} */
   let bindings = {};
+  /**
+   * 会话 → 「这个绑定是不是被一句人话锚死的」。
+   *
+   * 为什么需要它：`bindings` 只记「落在哪个分区」，看不出这个落点是怎么来的 ——
+   * 是他说了第一句话钉的，还是被 `runtime-context` 那种系统注入顺手带出来的。
+   * 两者的可信度天差地别，混在一张表里就会出现「刚钉好，下一秒被注入改走」。
+   * 详见 `bindSessionIfNew()`。
+   *
+   * @type {Record<string, boolean>}
+   */
+  let anchored = {};
   const bindingsPath = path.join(libraryRoot, BINDINGS_FILE);
   try {
     if (existsSync(bindingsPath)) {
-      const parsed = parseBindings(JSON.parse(readFileSync(bindingsPath, 'utf8')));
+      const parsed = parseBindings(parseJsonText(readFileSync(bindingsPath, 'utf8')));
       bindings = parsed.bindings;
+      anchored = parsed.locked;
       for (const msg of parsed.problems) warn(`绑定表：${msg}`);
     }
   } catch (err) {
     warn(`绑定表读不了，所有会话都跟随当前分区：${err instanceof Error ? err.message : String(err)}`);
     bindings = {};
+    anchored = {};
   }
 
   /** 取某个分区的运行时（只包 id / dir / store，真东西都在 storePool）。 */
@@ -854,6 +954,140 @@ export function apply(ctx, rawConfig) {
     return realStoreOf(spaceIdOfSession(sessionId));
   }
 
+  /** 某个分区 id 的显示名。查不到就回 id 本身（名字永远不该是空的）。 */
+  function spaceNameOf(spaceId) {
+    const id = String(spaceId || activeSpaceId);
+    const hit = (spaceInfo.spaces ?? []).find((sp) => sp.id === id);
+    return hit !== undefined && typeof hit.name === 'string' && hit.name !== '' ? hit.name : id;
+  }
+
+  /** `Workspace（workspace）`：光给 id 没人看得懂，光给名字又跟目录名对不上。 */
+  function spaceLabelOf(spaceId) {
+    const id = String(spaceId || activeSpaceId);
+    const name = spaceNameOf(id);
+    return name === id ? id : `${name}（${id}）`;
+  }
+
+  /**
+   * 子会话 → 父会话。子代理、fork 出来的会话都靠它找回「派它的那一局」。
+   *
+   * 只在内存里，不落盘：agent 一创建（或者会话第一条事件）就能重新记一遍，
+   * 落盘只会多一个会跟真相对不上的副本。
+   *
+   * @type {Map<string, string>}
+   */
+  const parentSessionOf = new Map();
+
+  /** 记一条「谁是它的爹」。空值 / 自己指自己都不记。 */
+  function rememberParent(childId, parentId) {
+    const c = typeof childId === 'string' ? childId.trim() : '';
+    const p = typeof parentId === 'string' ? parentId.trim() : '';
+    if (c === '' || p === '' || c === p) return;
+    parentSessionOf.set(c, p);
+  }
+
+  /** 从 agent 对象上把父子关系捞一遍（agent.session.header.parentSession）。 */
+  function rememberParentOfAgent(agent) {
+    const id = agent?.id ?? agent?.session?.id;
+    rememberParent(id, agent?.session?.header?.parentSession);
+  }
+
+  /**
+   * 沿 parentSession 往上找最近一个**有绑定**的分区。
+   *
+   * 用在：子代理 / fork 出来的会话自己不绑分区（它们连写都不写），
+   * 但它们要跟**派它的那一局**看同一个库。
+   *
+   * @returns {string|null} 分区 id；`''` = 那个祖先**显式未挂载**（原分区被删了）；
+   *   `null` = 一路往上都没找到绑定
+   */
+  function inheritedSpaceId(sessionId) {
+    let cur = typeof sessionId === 'string' ? sessionId.trim() : '';
+    const seen = new Set();
+    while (cur !== '' && !seen.has(cur)) {
+      seen.add(cur);
+      if (Object.prototype.hasOwnProperty.call(bindings, cur)) {
+        // 绑定值可能是 `''`（这个会话原来的分区被删了）—— 必须原样往上带，
+        // 不能当成「没找到」，否则会回落 active 把记忆倒进别的库。
+        return bindings[cur] === '' ? '' : spaceIdOfSession(cur);
+      }
+      const up = parentSessionOf.get(cur);
+      if (up === undefined) return null;
+      cur = up;
+    }
+    return null;
+  }
+
+  /**
+   * 某个会话「看记忆」时该用哪个分区。
+   *
+   * 顺序：自己绑定的 → 沿 parentSession 往上继承（子代理走这条）→ 当前激活分区。
+   * **`''` = 显式未挂载**（原分区被删了）：注入要整段不出，绝不回落 active。
+   * 只读语义：这里算出来的分区从不写回绑定表。
+   */
+  function spaceIdForView(sessionId) {
+    const sid = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (sid === '') return activeSpaceId;
+    const inherited = inheritedSpaceId(sid);
+    if (inherited !== null) return inherited;
+    return spaceIdOfSession(sid);
+  }
+
+  /**
+   * 这次**工具调用**该读哪个分区。
+   *
+   * 规矩：**工具跟着会话走**。会话绑了哪个分区，`memory_stats` /
+   * `memory_search` 就只看那个分区 —— 多个分区才是真正互相看不见的独立库。
+   *
+   * 2026-10-29 之前它们是跟着「当前激活分区」走的：在没有会话上下文的实现里
+   * 那是唯一能拿到的东西，但结果是「面板写着 active=A、这一局钉在 B」时，
+   * 模型在 B 这局里问 memory_stats，拿回来的是 A 的条数和容量，看着就像串了。
+   *
+   * 子代理 / fork 会话自己不绑定、也不写记忆，它们**继承派它的那一局**的分区
+   * （见 `inheritedSpaceId`）—— 这样领队在哪个库，派出的小工就在哪个库。
+   *
+   * 拿不到会话（测试直调、没有 agent 上下文）或这一整条父链都没绑定 →
+   * 跟着当前激活分区，而且**不落绑定**：工具不是人话，钉分区只能由第一句人话决定。
+   *
+   * @param {{agent?: {id?: string, session?: {id?: string, header?: {parentSession?: string}}}}} [exec] 工具执行上下文
+   */
+  function spaceOfCaller(exec) {
+    const agent = exec?.agent;
+    const rawId = agent?.id ?? agent?.session?.id;
+    const sid = typeof rawId === 'string' ? rawId.trim() : '';
+    if (sid === '') return { id: activeSpaceId, label: spaceLabelOf(activeSpaceId), bound: false };
+    if (Object.prototype.hasOwnProperty.call(bindings, sid)) {
+      const id = spaceIdOfSession(sid);
+      // 自己绑着但值是 `''`：原来那个分区被删了，等他去挂
+      if (id === '') return { id: '', label: '未挂载', bound: true, unmounted: true };
+      return { id, label: spaceLabelOf(id), bound: true };
+    }
+    // 子代理 / fork：看派它的那一局（祖先也可能已经未挂载）
+    const inherited = inheritedSpaceId(sid);
+    if (inherited === '') return { id: '', label: '未挂载', bound: false, inherited: true, unmounted: true };
+    if (inherited !== null) {
+      return { id: inherited, label: spaceLabelOf(inherited), bound: false, inherited: true };
+    }
+    return { id: activeSpaceId, label: spaceLabelOf(activeSpaceId), bound: false };
+  }
+
+  /**
+   * 在某个分区的上下文里跑一段**同步**代码，跑完立刻恢复。
+   *
+   * 和上面那个 `withSpace()` 的区别：这个是同步的、不经过 await ——
+   * 两局同时调工具时 `opSpaceId` 绝不会在 await 之间被另一局看着改走。
+   * 工具的执行体除了开头等 `loadPromise`，剩下全是同步的，所以能吃这条。
+   */
+  function usingSpace(spaceId, fn) {
+    const prev = opSpaceId;
+    opSpaceId = String(spaceId || activeSpaceId);
+    try {
+      return fn();
+    } finally {
+      opSpaceId = prev;
+    }
+  }
+
   /** 会话第一次出现就钉住分区；已经钉过的不动。 */
   /* ── bot 记忆专区：独立持久化 ────────────────────────────────────
      为什么不放 config / settings.json：这两个都会被「切分区」「面板覆盖设置」
@@ -861,8 +1095,18 @@ export function apply(ctx, rawConfig) {
      「当前记忆分区」切到哪儿、面板设置怎么改，bot 的会话都只进那一个。
      所以单独一个文件：<库根>/bot-space.json */
   const BOT_SPACE_FILE = 'bot-space.json';
-  /** @type {{spaceId: string, lockedAt: number, seenUins: Record<string, number>}} */
-  let botSpace = { spaceId: '', lockedAt: 0, seenUins: {} };
+  /**
+   * @type {{spaceId: string, lockedAt: number, seenUins: Record<string, number>,
+   *         lockForeign: boolean, sessions: string[]}}
+   *
+   * `lockForeign`（BOT 分区锁，2026-10-29 他要求，**默认开**）：
+   * 打开后**其他对话无法对这个分区读写** —— 桌面会话不落进来、也不能手动挂进来，
+   * 已经挂在里面的会被打成「未挂载」。QQ 那边不受影响。
+   *
+   * `sessions`：认出来的桥接会话 id（QQ 的）。锁要靠它区分「谁是 QQ、谁是桌面」：
+   * 会话本身不带来源标记，只能靠「这个会话发来过 bridged 消息」认。
+   */
+  let botSpace = { spaceId: '', lockedAt: 0, seenUins: {}, lockForeign: true, sessions: [] };
 
   function botSpacePath() {
     return path.join(libraryRoot, BOT_SPACE_FILE);
@@ -870,7 +1114,7 @@ export function apply(ctx, rawConfig) {
 
   function loadBotSpace() {
     try {
-      const raw = JSON.parse(readFileSync(botSpacePath(), 'utf8'));
+      const raw = parseJsonText(readFileSync(botSpacePath(), 'utf8'));
       botSpace = {
         spaceId: typeof raw?.spaceId === 'string' ? raw.spaceId : '',
         lockedAt: Number(raw?.lockedAt) || 0,
@@ -878,6 +1122,11 @@ export function apply(ctx, rawConfig) {
           raw !== null && typeof raw?.seenUins === 'object' && raw.seenUins !== null
             ? { ...raw.seenUins }
             : {},
+        // 老文件没有这个字段 → **当打开**（他要求默认打开）
+        lockForeign: raw?.lockForeign !== false,
+        sessions: Array.isArray(raw?.sessions)
+          ? raw.sessions.filter((x) => typeof x === 'string' && x.trim() !== '')
+          : [],
       };
     } catch {
       // 第一次跑没有这个文件，保持默认
@@ -896,11 +1145,97 @@ export function apply(ctx, rawConfig) {
 
   loadBotSpace();
 
+  // BOT 分区锁（默认开）在启动时先扫一遍：把「绑定指向专区、但不是认出来的 QQ 会话」
+  // 打成未挂载。放在 try 里 —— 锁判断出错绝不能挡住插件加载。
+  try {
+    const moved = enforceBotLock();
+    if (moved > 0) {
+      warn(`BOT 分区锁：${moved} 个非 QQ 会话被移出「${botSpaceId()}」，已变成未挂载（去小标签里挑一个分区）`);
+    }
+  } catch (err) {
+    warn(`BOT 分区锁初始化失败（不影响使用）：${err instanceof Error ? err.message : String(err)}`);
+  }
+
   /** bot 专区实际用哪个分区：面板钉死的优先，其次配置里的。都没有 = 不分区。 */
   function botSpaceId() {
     const fromFile = typeof botSpace.spaceId === 'string' ? botSpace.spaceId.trim() : '';
     if (fromFile !== '') return fromFile;
     return typeof config.botSpaceId === 'string' ? config.botSpaceId.trim() : '';
+  }
+
+  /**
+   * 「BOT 分区锁」现在是不是生效：装了 qq-bot（专区启用）+ 开关是开的。
+   *
+   * 生效时：桌面会话**不能**读写 bot 分区（新会话不落进来、手动挂不进来、
+   * 已经挂着的打成未挂载）；QQ 会话照旧。面板的管理入口（浏览/导出/体检/恢复）
+   * 不受影响 —— 锁只管「对话」。
+   */
+  function botSpaceLockedEffective() {
+    const id = botSpaceId();
+    if (!botSpaceEnabledEffective() || id === '' || botSpace.lockForeign !== true) return false;
+    // 专区指向一个不存在的分区 → 锁不生效（否则会在一个没东西可锁的地方 pretending 生效）。
+    // 这一步也顺手保住「全新库 / 没装 bot / 没选分区」三种情况下什么都不做。
+    return (spaceInfo.spaces ?? []).some((s) => s.id === id);
+  }
+
+  /** 这个会话是不是认出来的桥接（QQ）会话。 */
+  function isBotSession(sessionId) {
+    const sid = typeof sessionId === 'string' ? sessionId.trim() : '';
+    return sid !== '' && Array.isArray(botSpace.sessions) && botSpace.sessions.includes(sid);
+  }
+
+  /** 把某个会话记成「桥接会话」（幂等，只记前 500 个，别让文件无限长）。 */
+  function rememberBotSession(sessionId) {
+    const sid = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (sid === '') return false;
+    const list = Array.isArray(botSpace.sessions) ? botSpace.sessions : [];
+    if (list.includes(sid)) return false;
+    const next = list.concat([sid]);
+    botSpace.sessions = next.length > 500 ? next.slice(next.length - 500) : next;
+    return true;
+  }
+
+  /**
+   * 桌面会话该落到哪个分区：**非 bot 分区里最新创建的那个**（按 createdAt）。
+   * 用在两处：① 锁打开时 active 指向 bot 分区，新会话不能落进去
+   * ② 删掉的正好是 active 时（和 deleteSpace 里同一套规矩）。
+   */
+  function desktopFallbackSpaceId() {
+    const botId = botSpaceId();
+    const botOn = botSpaceEnabledEffective() && botId !== '';
+    const list = (spaceInfo.spaces ?? []).filter((s) => !(botOn && s.id === botId));
+    const pool = list.length > 0 ? list : spaceInfo.spaces ?? [];
+    const byNewest = [...pool].sort((a, b) =>
+      String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')),
+    );
+    return byNewest[0]?.id ?? activeSpaceId;
+  }
+
+  /**
+   * 把「锁打开后不该待在 bot 分区里的会话」打成未挂载（`bindings[sid] = ''`）。
+   *
+   * 判据：绑定指向 bot 分区，**且**不是认出来的桥接会话。
+   * 为什么用这个判据：会话本身不带来源标记，只能靠「它发来过 bridged 消息」认。
+   * 历史 QQ 会话如果还没被认出来，会被误打一次 —— 但它下一条 QQ 消息一到，
+   * `bindSessionIfNew()` 会把它认出来并**立刻绑回** bot 分区，中间不丢记忆
+   * （固化发生在消息之后）。
+   *
+   * @returns {number} 这次打成未挂载的会话数
+   */
+  function enforceBotLock() {
+    if (!botSpaceLockedEffective()) return 0;
+    const botId = botSpaceId();
+    let unmounted = 0;
+    let touched = false;
+    for (const sid of Object.keys(bindings)) {
+      if (bindings[sid] !== botId) continue;
+      if (isBotSession(sid)) continue;
+      bindings[sid] = '';
+      unmounted += 1;
+      touched = true;
+    }
+    if (touched) persistBindings();
+    return unmounted;
   }
 
   /** 面板要的 bot 专区状态。 */
@@ -926,6 +1261,11 @@ export function apply(ctx, rawConfig) {
       spaces: list,
       pluginPresent: botPluginPresent(),
       enabled: botSpaceEnabledEffective(),
+      /** BOT 分区锁：开 = 其他对话不能读写这个分区（默认开） */
+      lockForeign: botSpace.lockForeign === true,
+      lockEffective: botSpaceLockedEffective(),
+      /** 已经认出来的桥接会话数（锁靠它区分谁是 QQ） */
+      botSessions: Array.isArray(botSpace.sessions) ? botSpace.sessions.length : 0,
     };
   }
 
@@ -998,14 +1338,20 @@ export function apply(ctx, rawConfig) {
    * 这条来源算不算「桥接进来的」（QQ 之类），bot 专区只认这种。
    *
    * 桌面端自己打字的 `source.kind` 是 `user`，它不是桥接 —— 见 `spaceForIncoming`。
-   * 除了 `user`，任何非空 kind 都算桥接：不要求它在 `sourceKinds` 白名单里。
+   * harness 自己追发的几条（`runtime-context` / `skill-catalog` / `time-context`）
+   * 同样不是，见 `INTERNAL_SOURCE_KINDS` 里的说明。
+   *
+   * 除了这两类，任何非空 kind 都算桥接：不要求它在 `sourceKinds` 白名单里。
    * 白名单管的是「这句话要不要当成人话记进记忆」，跟「它属于哪个分区」是两件事。
    * 比如 qq-bot 派的活（`kind = 'dsh-qq-bot'`，写日记 / 轮询说说走这条）不在白名单里
    * —— 它不写记忆，但它属于**那个 QQ 会话**，绑分区时必须认得出是桥接，
    * 否则新一局在建出来那一刻就先被任务消息钉到"当时激活的分区"上了。
    */
   function isBridgedSource(kind) {
-    return typeof kind === 'string' && kind !== '' && kind !== 'user';
+    if (typeof kind !== 'string' || kind === '') return false;
+    if (kind === 'user') return false;
+    if (INTERNAL_SOURCE_KINDS.includes(kind)) return false;
+    return true;
   }
 
   /** `botUins` 解析成数组。空 / 坏值 → 空数组（= 不按号过滤）。 */
@@ -1017,21 +1363,90 @@ export function apply(ctx, rawConfig) {
       .filter((s) => s !== '');
   }
 
+  /**
+   * 钉分区。三种结局：首次钉住 / 人话纠正 / 一律不动。
+   *
+   * 核心规则（2026-10-29 修）：**只有「人话」来源能锚死一个绑定，也只有人话
+   * 来源能纠正它。**
+   *
+   * 为什么：DSH 在他说完一句话之后会紧接着追加几条 `user/message` 事件
+   * （`runtime-context` / `skill-catalog` / `time-context`）。它们不是他说的，
+   * 但事件类型一模一样。旧逻辑里 `isBridgedSource()` 只把 `user` 排除在外，
+   * 于是这几条被当成「QQ 那种外部桥接」→ 命中 bot 专区 → 撞进下面的
+   * 「例外改绑」分支，把刚钉好的分区**当场改写**成 bot 专区。
+   * 实测症状：一句话说完 6 秒内，注入内容从 workspace 变成 private，
+   * 而面板上 active 还写着 workspace —— 两边各说各话。
+   *
+   * 现在拆成两道防线：
+   *   1. `isBridgedSource()` 不再把 harness 自己的系统注入算成桥接；
+   *   2. 这里再兜一层 —— 不是人话就没有改绑资格。将来 DSH 再加别的
+   *      系统来源种类，第一道可能漏，第二道捅不破。
+   */
   function bindSessionIfNew(sessionId, source) {
+    const kind = source?.kind;
+    // 「人话」= 配置里 `sourceKinds` 白名单（默认 user,qq）。
+    // 那份白名单管的是「这句要不要当他说的话记进记忆」，拿它当「有没有资格
+    // 钉分区」的凭据，语义正好对齐；社区接了别的桥接，往配置里加一项就行。
+    const human = userSourceKinds().includes(kind);
     // bot 专区命中就绑专区，否则还是绑当前激活分区（老行为）
     const botTarget = spaceForIncoming(source);
-    const target = botTarget ?? activeSpaceId;
+    const botId = botSpaceId();
+
+    // ① 桥接会话（QQ）先认人：记进 botSpace.sessions —— BOT 分区锁靠这个
+    //    区分「谁是 QQ、谁是桌面」。认出来之后，哪怕它被锁打成未挂载、
+    //    哪怕它已经锚死了，也要立刻绑回专区（「它是 QQ 会话」是硬事实，比锚定权威）。
+    //
+    //    **只认「人话」来源**（kind 在 sourceKinds 白名单里，比如 qq）：
+    //    系统注入 / 插件派活一律不算 —— 否则又会回到「注入把锚定的会话改绑走」那个坑
+    //    （2026-10-29 上午刚修完，别把它拆了）。
+    if (human && botTarget !== undefined && botTarget !== '' && botTarget === botId) {
+      const learned = rememberBotSession(sessionId);
+      if (learned) saveBotSpace();
+      if (bindings[sessionId] !== botTarget) {
+        const prev = bindings[sessionId];
+        bindings[sessionId] = botTarget;
+        anchored[sessionId] = true;
+        persistBindings();
+        invalidateRender(sessionId);
+        log(`会话 ${String(sessionId)} 认出是 QQ 会话，绑回专区「${botTarget}」（原：${String(prev)}）`);
+        return;
+      }
+    }
+
+    // ② 桌面会话不许落进被锁住的 bot 分区：active 正好指着它时改落到非 bot 最新分区
+    let target = botTarget ?? activeSpaceId;
+    if (
+      botTarget === undefined &&
+      botSpaceLockedEffective() &&
+      target === botId &&
+      !isBotSession(sessionId)
+    ) {
+      target = desktopFallbackSpaceId();
+      log(`BOT 分区锁生效：桌面会话不落「${botId}」，改落「${target}」`);
+    }
+
     if (bindIfNew(bindings, sessionId, target)) {
+      anchored[sessionId] = human;
+      persistBindings();
+      if (human) log(`会话 ${String(sessionId)} 钉在「${target}」（人话锚定）`);
+      return;
+    }
+
+    // 已经绑过的会话一般不动（这就是「旧会话留在原分区」）。
+    // 被锚死的，到此为止 —— 系统注入、插件派活都改不动它。
+    if (isAnchored(anchored, sessionId)) return;
+    // 还没锚死 = 当前这个绑定是「系统来源临时钉的」，只允许人话来纠正
+    if (!human) return;
+
+    const prev = bindings[sessionId];
+    // 人话来了但没指向专区 → 说明当前落点本来就是对的，顺手锚死
+    if (botTarget === undefined || prev === botTarget) {
+      anchored[sessionId] = true;
       persistBindings();
       return;
     }
-    // 已经绑过的会话一般不动（这就是「旧会话留在原分区」）。
-    // **例外**：bot 来源且专区锁定 —— 这类会话必须钉在锁定分区上。历史绑定可能是
-    // 「被提前钉下的错值」（见 session/event 钩子里的注释），见到真身就改回来。
-    if (botTarget === undefined) return;
-    const prev = bindings[sessionId];
-    if (prev === botTarget) return;
     bindings[sessionId] = botTarget;
+    anchored[sessionId] = true;
     persistBindings();
     invalidateRender(sessionId);
     log(`会话 ${String(sessionId)} 原来绑在「${prev}」，按 bot 专区锁定改到「${botTarget}」`);
@@ -1040,7 +1455,15 @@ export function apply(ctx, rawConfig) {
   /** 把绑定表落盘（失败只 warn —— 记不住绑定不影响记忆）。 */
   function persistBindings() {
     try {
-      writeFileSync(bindingsPath, `${JSON.stringify({ version: 1, bindings }, null, 2)}\n`, 'utf8');
+      // 只写还有绑定的那些会话，锚定表跟着绑定表走，不留孤儿键
+      /** @type {Record<string, boolean>} */
+      const locked = {};
+      for (const sid of Object.keys(bindings)) locked[sid] = anchored[sid] === true;
+      writeFileSync(
+        bindingsPath,
+        `${JSON.stringify({ version: 1, bindings, locked }, null, 2)}\n`,
+        'utf8',
+      );
     } catch (err) {
       warn(`绑定表落盘失败：${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1065,6 +1488,10 @@ export function apply(ctx, rawConfig) {
         name: sp.name,
         createdAt: sp.createdAt,
         active: sp.id === activeSpaceId,
+        // 前端靠这个把「删除」按钮禁掉（Qbot 指定的分区不许删）
+        bot: botSpaceEnabledEffective() && botSpaceId() === sp.id,
+        // 有多少会话钉在这个分区上 —— 删除确认里要报出来（它们会变成未挂载）
+        bindings: Object.values(bindings).filter((v) => v === sp.id).length,
         lastActivityAt: lastAt > 0 ? new Date(lastAt).toISOString() : null,
         counts: {
           short: rt.store.zones.short.length,
@@ -1128,36 +1555,95 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * 删分区：整个目录搬进 `_trash/<id>-<时间戳>/`，**不真删**，随时能捞回来。
-   * 至少留一个；删的是当前分区就自动切到剩下的第一个；指向它的绑定一并清掉。
+   * 删分区：**真删**（目录整个移除，不可恢复；镜像里那份会留着当救命稻草）。
+   *
+   * 三条硬规矩（2026-10-29 他定的）：
+   *  1. **Qbot 指定的那个分区不许删** —— 删了 QQ 的记忆就没地方去了。
+   *  2. **删完必须至少还剩一个「非 Qbot 分区」** —— 新会话仍会落到 active，
+   *     只剩 QQ 专区的话，桌面新会话的记忆会直接写进 QQ 那个库。
+   *  3. 挂在这个分区上的会话**不回落 active**，而是变成「未挂载」（绑定记成 `''`）：
+   *     等他本人在会话下面那个小标签里挑一个分区挂上去，在那之前这局不读写记忆。
+   *
+   * 删的正好是 active 时，自动切到「剩下的非 Qbot 分区里**最新创建**的那个」。
    */
   function deleteSpace(id) {
     const list = spaceInfo.spaces ?? [];
     const sp = list.find((s) => s.id === id);
     if (sp === undefined) return { ok: false, reason: `没有这个分区：${id}` };
-    if (list.length <= 1) return { ok: false, reason: '至少要留一个分区' };
-    const from = spaceDirOf(libraryRoot, id);
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    const to = path.join(libraryRoot, TRASH_DIR, `${id}-${stamp}`);
-    try {
-      mkdirSync(path.dirname(to), { recursive: true });
-      renameSync(from, to);
-    } catch (err) {
-      return { ok: false, reason: `搬到 _trash 失败：${err instanceof Error ? err.message : String(err)}` };
+
+    const botOn = botSpaceEnabledEffective();
+    const botId = botOn ? botSpaceId() : '';
+    if (botOn && botId !== '' && botId === id) {
+      return { ok: false, reason: '这是 Qbot 指定的分区，不能删 —— 删了 QQ 的记忆就没地方去了' };
     }
-    spaceInfo.spaces = list.filter((s) => s.id !== id);
-    const pruned = pruneBindings(bindings, spaceInfo.spaces.map((s) => s.id));
-    bindings = pruned.bindings;
+
+    const remaining = list.filter((s) => s.id !== id);
+    const nonBot = remaining.filter((s) => !(botOn && s.id === botId));
+    if (nonBot.length === 0) {
+      return {
+        ok: false,
+        reason: botOn
+          ? '删完就只剩 Qbot 分区了：新会话会全部写进 QQ 那个库。先新建一个分区再删'
+          : '至少要留一个分区',
+      };
+    }
+
+    // ── 真删目录 ──
+    const dir = spaceDirOf(libraryRoot, id);
+    try {
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    } catch (err) {
+      return { ok: false, reason: `删目录失败：${err instanceof Error ? err.message : String(err)}` };
+    }
+
+    // ── 镜像那份留着，但打一个「已删」标记 ──
+    // 为什么必须打：镜像目录是按 spaceId 命名的，删了之后再新建一个同名分区，
+    // 「从镜像恢复」会把旧记忆当成新分区的备份灌进去 —— 等于删掉的记忆自己爬回来。
+    try {
+      const src = mirrorPartitionDir(id);
+      // ⚠️ 一定先判空：没配镜像目录时它是 `''`，而 `path.dirname('')` 是 `'.'`，
+      // 会把标记文件写到进程当前目录（当天测试里真发生过，插件源码目录多出一个
+      // `._deleted.json`）。宁可少打一个标记，也不能往别人目录里写东西。
+      if (src !== '') {
+        const holder = path.dirname(src); // <mirrorDir>/<spaceId>
+        if (existsSync(holder)) {
+          writeFileSync(
+            path.join(holder, DELETED_MARKER_FILE),
+            `${JSON.stringify({ deletedAt: new Date().toISOString(), spaceId: id, name: sp.name }, null, 2)}\n`,
+            'utf8',
+          );
+        }
+      }
+    } catch {
+      // 标记失败不影响删除本身
+    }
+
+    spaceInfo.spaces = remaining;
+
+    // 挂在这个分区上的会话 → 显式未挂载。**不能把绑定删掉**：
+    // 删掉就等于「从来没绑过」，下一轮会默默回落到 active。
+    let unmounted = 0;
+    for (const sid of Object.keys(bindings)) {
+      if (bindings[sid] === id) {
+        bindings[sid] = '';
+        unmounted += 1;
+      }
+    }
     persistBindings();
+
     storePool.delete(id);
     if (activeSpaceId === id) {
-      activeSpaceId = spaceInfo.spaces[0].id;
+      const byNewest = [...nonBot].sort((a, b) =>
+        String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')),
+      );
+      const next = byNewest[0] ?? nonBot[0] ?? remaining[0];
+      activeSpaceId = next.id;
       dataDir = spaceDirOf(libraryRoot, activeSpaceId);
     }
-    if (!persistRegistry()) return { ok: false, reason: '注册表写不进去（目录已经搬到 _trash 了）' };
+    if (!persistRegistry()) return { ok: false, reason: '注册表写不进去（目录已经删了，别重启）' };
     invalidateAllRenders();
-    log(`删掉分区「${sp.name}」→ _trash/${path.basename(to)}`);
-    return { ok: true, movedTo: to, active: activeSpaceId, unbound: pruned.removed };
+    log(`删掉分区「${sp.name}」（真删）· 解挂 ${unmounted} 个会话 · active=${activeSpaceId}`);
+    return { ok: true, deleted: true, spaceId: id, active: activeSpaceId, unmounted };
   }
 
   /** 在某个分区的上下文里跑一段（同步或异步都行），跑完恢复。 */
@@ -1188,7 +1674,7 @@ export function apply(ctx, rawConfig) {
       dataDir = spaceDirOf(libraryRoot, id);
       try {
         const regPath = path.join(libraryRoot, REGISTRY_FILE);
-        const reg = JSON.parse(readFileSync(regPath, 'utf8'));
+        const reg = parseJsonText(readFileSync(regPath, 'utf8'));
         reg.active = id;
         writeFileSync(regPath, `${JSON.stringify(reg, null, 2)}\n`, 'utf8');
       } catch (err) {
@@ -1266,6 +1752,30 @@ export function apply(ctx, rawConfig) {
       }
       ready = true;
       log('记忆库就绪');
+
+      // 2026-10-29 加：外部工具（迁移脚本、导入、手改）动过 jsonl 之后，
+      // 以前只能靠「重启应用」才读得到 —— 中间只要插件落一次盘，改动就被内存
+      // 旧副本整份盖回去（当天真实发生过一次，296 条改动蒸发）。
+      // 现在每个分区都盯一下自己的文件，内容对不上就重读 + 清渲染缓存。
+      for (const sp of spaceInfo.spaces ?? []) {
+        try {
+          const rt = ensureRuntime(sp.id);
+          rt.store.watchExternal(() => {
+            invalidateAllRenders();
+            log(`记忆库被外部改动，已重读：${sp.name ?? sp.id}`);
+          });
+        } catch (err) {
+          warn(`盯不住分区「${sp.name ?? sp.id}」的文件：${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      try {
+        ensureRuntime(activeSpaceId).store.watchExternal(() => {
+          invalidateAllRenders();
+          log(`记忆库被外部改动，已重读：${activeSpaceId}`);
+        });
+      } catch (err) {
+        warn(`盯不住当前分区的文件：${err instanceof Error ? err.message : String(err)}`);
+      }
     } catch (err) {
       degraded = true;
       warn(`记忆库载入异常，本次以「只读不记」模式运行：${err instanceof Error ? err.message : String(err)}`);
@@ -1312,8 +1822,14 @@ export function apply(ctx, rawConfig) {
   function renderFor(agentId) {
     // 渲染要按「这个会话绑定的分区」取记忆。renderForInner 里那几十处 store.xxx
     // 全靠 opSpaceId 指路，所以这里设好再交给内层。
+    // 用 spaceIdForView 而不是 spaceIdOfSession：子代理自己不绑定，
+    // 但它要跟**派它的那一局**看同一个库（见 inheritedSpaceId）。
+    const where = spaceIdForView(agentId);
+    // `''` = 这个会话原来的分区被删了、还没重新挂 → 记忆段整段不出。
+    // 这时候一句「记忆库在哪」都不该说，更不能回落 active 去读别人的库。
+    if (where === '') return '';
     const prev = opSpaceId;
-    opSpaceId = spaceIdOfSession(agentId);
+    opSpaceId = where;
     try {
       // 告警加在缓存**外面**：renderForInner 按轮缓存正文，故障状态却每轮都可能变，
       // 放进缓存里就会卡在上一轮的状态上。
@@ -1394,6 +1910,9 @@ export function apply(ctx, rawConfig) {
 
   function installPrompt(agent) {
     if (agent === undefined || agent === null) return undefined;
+    // 顺手记下父子关系（子代理 / fork 的会话都有 parentSession）。
+    // 子代理自己不写记忆，但读的时候要跟派它的那一局看同一个分区。
+    rememberParentOfAgent(agent);
     if (promptFibers.has(agent)) return promptFibers.get(agent);
     let fiber;
     try {
@@ -1485,8 +2004,14 @@ export function apply(ctx, rawConfig) {
       //
       // session.header.parentSession 是子代理与父会话的持久链接（fork 继承的会话
       // 也有它），所以这一条能同时挡住「新派的子代理」和「从父会话 fork 出来的」。
+      //
+      // 2026-10-29：return 之前先把父子关系记进 parentSessionOf ——
+      // 子代理不写记忆，但它**读**的时候要跟派它的那一局看同一个分区。
       const parentSession = session?.header?.parentSession;
-      if (parentSession !== undefined && parentSession !== null) return;
+      if (parentSession !== undefined && parentSession !== null) {
+        rememberParent(session?.id, parentSession);
+        return;
+      }
 
       const id = session?.id;
       if (typeof id !== 'string' || id === '') return;
@@ -1699,6 +2224,16 @@ export function apply(ctx, rawConfig) {
     const src = mirrorPartitionDir(spaceId);
     if (src === '') return { ok: false, reason: '没配镜像目录（mirrorDir 是空的）' };
     if (!existsSync(src)) return { ok: false, reason: `镜像里没有分区「${spaceId}」的备份` };
+    // 这个分区曾经被真删过 → 镜像里那份是「已删分区」的遗产，
+    // 不许自动灌进一个同名的新分区（那等于删掉的记忆自己爬回来）。
+    // 真想捞：手动去镜像目录把文件拷回来。
+    const holder = path.dirname(src);
+    if (existsSync(path.join(holder, DELETED_MARKER_FILE))) {
+      return {
+        ok: false,
+        reason: `镜像里那份属于一个**已经删掉**的分区（${path.join(holder, DELETED_MARKER_FILE)}），不能自动恢复。真要捞就手动把 ${src} 里的 jsonl 拷回库目录。`,
+      };
+    }
     const targetDir = spaceDirOf(libraryRoot, spaceId);
     try {
       mkdirSync(targetDir, { recursive: true });
@@ -2004,7 +2539,10 @@ export function apply(ctx, rawConfig) {
       if (typeof id !== 'string' || id === '') return;
       // 子代理的回合不写记忆 —— 理由见 session/event 那段
       const parentSession = agent?.session?.header?.parentSession;
-      if (parentSession !== undefined && parentSession !== null) return;
+      if (parentSession !== undefined && parentSession !== null) {
+        rememberParent(id, parentSession);
+        return;
+      }
 
       const s = stateOf(id);
       if (s.turn === 0 || s.lastUserText === '') return;
@@ -2124,7 +2662,15 @@ export function apply(ctx, rawConfig) {
       '正文放 detail（≤200 字），一句话概括放 title（≤40 字）；weight 用 0~1 的小数（如 0.5，别用 3、8 这种满分制）；zone 只能是 short、long、permanent。',
       // 2026-10-28 加：记忆是「她读给自己看的」，写成第三人称（"对方""用户""她"）以后，
       // 注入进上下文，她说话也跟着站到外面变成旁白。人称错了，人格文档压不住。
-      'title 和 detail 一律用第一人称「我」写，他称「他」；不要出现「对方」「用户」「她」这类第三人称指代。',
+      //
+      // 2026-10-29 改：方位从「我/他」改成「我/你」。原来写的「他称『他』」跟他在
+      // AGENT.md 里定的硬规矩（说他，一律「你」）正面打架 —— 注入进去以后她读到的
+      // 是「他」，说出口就跟着第三人称。而且「他」既是「他」又是任意第三方，
+      // 一旦引语嵌套（「他说：我碰不到那台机器」）就分不清谁是谁。
+      // 现在的约定：我=我，你=对方，真正的第三方才用「他」「她」。
+      'title 和 detail 一律用第一人称「我」写；说到对话对面那个人，一律用「你」。',
+      '不要用「他」「她」「对方」「用户」指对话对面那个人；只有真正的第三方（室友、同事、某个具体的人）才用「他」或「她」。',
+      '写的时候照对话里谁做了什么来定：你自己说的话、你做的事是「我」；对方说的做的，一律「你」。',
     ].join('\n');
   }
 
@@ -2137,7 +2683,13 @@ export function apply(ctx, rawConfig) {
    */
   async function consolidate(sessionId, agent, signal) {
     // 这条链会一路调到压缩 / 总量回收 / 自检 / 落盘，全都靠 opSpaceId 找对分区。
-    return withSpace(spaceIdOfSession(sessionId), () => consolidateInner(sessionId, agent, signal));
+    const where = spaceIdOfSession(sessionId);
+    // `''` = 这个会话原来的分区被删了、还没重新挂 → 这次不固化，也不许回落 active。
+    if (where === '') {
+      log(`会话 ${String(sessionId)} 未挂载分区（原分区被删），跳过这次固化`);
+      return;
+    }
+    return withSpace(where, () => consolidateInner(sessionId, agent, signal));
   }
 
   async function consolidateInner(sessionId, agent, signal) {
@@ -2332,6 +2884,12 @@ export function apply(ctx, rawConfig) {
           { zone, now: ctxInfo.now, session: ctxInfo.sessionId, source: 'chat', taken },
         );
         if (entry === null) continue;
+        // 2026-10-29：人称自检。条目里出现「他/她」却一次都没用「你」，大概率是
+        // 模型又退回第三人称了。**只记日志、不丢条目** —— 用格式错误惩罚内容，
+        // 丢掉的是一条真事。老条目那层由注入时的映射行（render.mjs HEAD_LINES）兜。
+        if (/[他她]/.test(`${entry.title}${entry.detail}`) && !/你/.test(`${entry.title}${entry.detail}`)) {
+          log(`人称自检：${entry.id} 通篇没用「你」，疑似第三人称写法`);
+        }
         taken.add(entry.id);
         store.add(entry);
         added += 1;
@@ -2844,16 +3402,19 @@ export function apply(ctx, rawConfig) {
     const n = Math.round(Number(added) || 0);
     if (n <= 0) return null;
 
-    dedupState.entriesSinceCheck += n;
+    // 账记在「这次入库落在哪个分区」上 —— 固化期间就是那个会话的分区。
+    const spaceId = currentSpaceId();
+    const st = dedupStateOf(spaceId);
+    st.entriesSinceCheck += n;
     const every = dedupEveryOf(config);
 
     if (!config.dedupEnabled) {
       // 关掉了也照样记账：重新打开时不用从头数
-      writeDedupState(dataDir, dedupState);
+      writeDedupState(dirForSpace(spaceId), st);
       return null;
     }
-    if (dedupState.entriesSinceCheck < every) {
-      writeDedupState(dataDir, dedupState);
+    if (st.entriesSinceCheck < every) {
+      writeDedupState(dirForSpace(spaceId), st);
       return null;
     }
     return runDedupNow({ signal, trigger: 'auto' });
@@ -2879,6 +3440,8 @@ export function apply(ctx, rawConfig) {
     await loadPromise;
     const sig = opts?.signal ?? abort.signal;
     const trigger = opts?.trigger === 'manual' ? 'manual' : 'auto';
+    // 这次自检算在哪个分区头上：一开始就定死，别指望后面的 store 代理一直不跑偏。
+    const spaceId = currentSpaceId();
     const threshold = dedupThresholdOf(config);
     const before = store.all().length;
 
@@ -2946,17 +3509,20 @@ export function apply(ctx, rawConfig) {
       log(`记忆库自检：合 ${groups} 组，${before} → ${after} 条（阈值 ${threshold}）`);
     }
 
-    dedupState = {
-      ...dedupState,
+    // 账记在这个分区自己那本上（切到别的分区时，别把进度写到人家文件里）
+    const st = dedupStateOf(spaceId);
+    const nextState = {
+      ...st,
       entriesSinceCheck: 0,
       lastCheckAt: Date.now(),
       lastGroups: groups,
       lastMerged: merged,
       lastChecked: checked,
-      totalGroups: dedupState.totalGroups + groups,
-      totalMerged: dedupState.totalMerged + merged,
+      totalGroups: st.totalGroups + groups,
+      totalMerged: st.totalMerged + merged,
     };
-    writeDedupState(dataDir, dedupState);
+    dedupStates.set(spaceId, nextState);
+    writeDedupState(dirForSpace(spaceId), nextState);
 
     return { skipped: '', groups, merged, checked, rounds, threshold, before, after };
   }
@@ -3351,18 +3917,20 @@ export function apply(ctx, rawConfig) {
    * @returns {object}
    */
   function dedupPanelState() {
+    // 面板看的永远是「当前激活分区」那本账（跟 /state 的读法一致）
+    const st = dedupStateOf(activeSpaceId);
     return {
       enabled: Boolean(config.dedupEnabled),
       every: dedupEveryOf(config),
       threshold: dedupThresholdOf(config),
       /** 自上次自检以来又攒了几条，满 every 就自动跑 */
-      pending: dedupState.entriesSinceCheck,
-      lastCheckAt: dedupState.lastCheckAt,
-      lastGroups: dedupState.lastGroups,
-      lastMerged: dedupState.lastMerged,
-      lastChecked: dedupState.lastChecked,
-      totalGroups: dedupState.totalGroups,
-      totalMerged: dedupState.totalMerged,
+      pending: st.entriesSinceCheck,
+      lastCheckAt: st.lastCheckAt,
+      lastGroups: st.lastGroups,
+      lastMerged: st.lastMerged,
+      lastChecked: st.lastChecked,
+      totalGroups: st.totalGroups,
+      totalMerged: st.totalMerged,
     };
   }
 
@@ -3434,6 +4002,12 @@ export function apply(ctx, rawConfig) {
       },
       // 分区体检：谁炸了、镜像里有没有备份
       health: partitionHealth(),
+      // 注册表**自己**的问题 —— 和上面那个 health 是两件事：
+      // health 查的是「已经注册的分区里谁炸了」，这里是「注册表压根没读懂」。
+      // 后者会让分区悄无声息地塌成单个，而那会儿 health 还是空的（因为没分区可查），
+      // 面板就会显示「分区都读得出来，没问题」——2026-10-29 真踩过一次，所以单列出来。
+      spaceProblems: (spaceInfo.problems ?? []).slice(),
+      spacesDegraded: spaceInfo.degraded === true,
       // 固化日志（面板上那个小框）。**只给形状**：时间 / 结果 / 条数 / 链路，
       // 不含对话正文、不含记忆内容。最近 30 次，环形。
       consolidate: {
@@ -3511,7 +4085,8 @@ export function apply(ctx, rawConfig) {
       /** 记忆库自检（去重）一次。默认按「手动」走（不受 dedupEnabled 拦），传 trigger:'auto' 才走自动那条路 */
       dedup: (opts) => runDedupNow({ ...opts, trigger: opts?.trigger === 'auto' ? 'auto' : 'manual' }),
       /** 自检进度（面板/测试用） */
-      dedupState: () => ({ ...dedupState }),
+      /** 自检进度（按分区各一份，这里给的是当前激活分区那本） */
+      dedupState: () => ({ ...dedupStateOf(activeSpaceId) }),
       renderFor,
     });
   } catch (err) {
@@ -3609,6 +4184,29 @@ export function apply(ctx, rawConfig) {
 
   ctx.inject(['webServer'], (scope) => {
     scope.effect(() => {
+      /**
+       * 面板的**写操作 / 导出**现在能不能动手。
+       *
+       * 为什么要有这条闸：固化是异步的（要等模型，几十秒都可能），那段时间全局
+       * `opSpaceId` 被钉在**那个会话的分区**上，`store` 代理就跟着它走 —— 这时候
+       * 面板的「忘掉 / 收割 / 压缩 / 自检 / 回收 / 导出」会作用到别的分区上。
+       * 实测过：面板写着 active=work，点「忘掉」却把 private 那条删掉了。
+       *
+       * 不去改那层最容易出事的全局代理（改它带出来的面太大），而是在这几秒里
+       * 直接回「稍后再试」—— 最坏情况是用户多点一次，绝不会写错分区。
+       *
+       * 读类接口（`/state` `/settings` 的 GET）不走这条闸：它们是**同步**的，
+       * 用 `usingSpace(activeSpaceId, …)` 明确只看「当前激活分区」，本来就不受影响，
+       * 而且不能被阻塞 —— 固化每轮结束都会跑，一阻塞面板就整片报错。
+       */
+      function panelMutationBlocked() {
+        return opSpaceId !== null;
+      }
+      const PANEL_BUSY = {
+        ok: false,
+        error: '正在固化记忆，稍等几秒再试（固化期间不能操作记忆库，免得落到别的分区上）',
+      };
+
       const routes = [
         {
           kind: 'exact',
@@ -3617,7 +4215,10 @@ export function apply(ctx, rawConfig) {
             try {
               if (req.method !== 'GET') return reply(res, 405, { ok: false, error: '只支持 GET' });
               await loadPromise;
-              return reply(res, 200, panelState(queryOf(req)));
+              // 读类：明确只看当前激活分区（固化期间也不会跟着 opSpaceId 跑偏），
+              // panelState 是同步的，包一层不影响任何行为。
+              return reply(res, 200, usingSpace(activeSpaceId, () => panelState(queryOf(req))));
+
             } catch (err) {
               return fail(res, 500, err);
             }
@@ -3641,7 +4242,12 @@ export function apply(ctx, rawConfig) {
                 new URL(String(req?.url ?? '/'), 'http://localhost').searchParams.get('session') ?? '',
               ).trim();
               if (sessionId === '') return reply(res, 400, { ok: false, error: '缺 session' });
-              const spaceId = String(spaceIdOfSession(sessionId) || activeSpaceId);
+              // 用 spaceIdForView：子代理自己不绑分区，但读的是派它的那一局的分区，
+              // 这里报的必须是「它实际在读哪个库」，不然面板上的小标签会骗人。
+              // `''` = 未挂载（原分区被删了）：这时候要把「可选的分区」一起给它，
+              // 前端靠它渲染那个「挑一个分区挂上去」的下拉。
+              const spaceId = String(spaceIdForView(sessionId) || '');
+              const unmounted = spaceId === '';
               const hit = (spaceInfo.spaces ?? []).find((sp) => sp.id === spaceId);
               // 只报分区，不报「这是不是 Qbot 专区」—— 那句话是面板里给用 Qbot 的人看的，
               // 不该出现在正常干活的对话页底（2026-10-28 他说的）。
@@ -3649,7 +4255,12 @@ export function apply(ctx, rawConfig) {
                 ok: true,
                 sessionId,
                 spaceId,
-                spaceName: hit?.name ?? spaceId,
+                spaceName: unmounted ? '' : (hit?.name ?? spaceId),
+                unmounted,
+                inherited:
+                  !Object.prototype.hasOwnProperty.call(bindings, sessionId) &&
+                  inheritedSpaceId(sessionId) !== null,
+                spaces: (spaceInfo.spaces ?? []).map((s) => ({ id: s.id, name: s.name })),
               });
             } catch (err) {
               return fail(res, 500, err);
@@ -3712,6 +4323,47 @@ export function apply(ctx, rawConfig) {
           },
         },
         {
+          // BOT 分区锁开关（默认开）。只在装了 qq-bot 的场景下才有意义：
+          // 没装 / 没设专区时 `lockEffective` 一律是 false，这里怎么切都不会碰到任何分区。
+          kind: 'exact',
+          path: `${PANEL_BASE}/bot-lock`,
+          handler: async (req, res) => {
+            try {
+              if (req.method === 'GET') {
+                await loadPromise;
+                return reply(res, 200, { ok: true, ...botSpacePanel() });
+              }
+              if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 GET / POST' });
+              let body;
+              try {
+                body = await readBody(req);
+              } catch (err) {
+                return fail(res, 413, err);
+              }
+              if (typeof body?.locked !== 'boolean') {
+                return reply(res, 400, { ok: false, error: '缺 locked（true / false）' });
+              }
+              botSpace.lockForeign = body.locked;
+              if (!saveBotSpace()) return reply(res, 500, { ok: false, error: '写不进 bot-space.json' });
+              // 打开 → 立刻把不该待在专区里的会话打成未挂载；关掉 → 什么都不用回收
+              const unmounted = enforceBotLock();
+              invalidateAllRenders();
+              log(
+                `BOT 分区锁 → ${body.locked ? '开' : '关'}${
+                  unmounted > 0 ? `，${unmounted} 个非 QQ 会话变成未挂载` : ''
+                }`,
+              );
+              return reply(res, 200, {
+                ok: true,
+                unmounted,
+                ...botSpacePanel(),
+              });
+            } catch (err) {
+              return fail(res, 500, err);
+            }
+          },
+        },
+        {
           // 从镜像补一个分区缺失的条目（只补缺失，不覆盖）
           kind: 'exact',
           path: `${PANEL_BASE}/recover`,
@@ -3739,6 +4391,7 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              if (panelMutationBlocked()) return reply(res, 409, PANEL_BUSY);
               let body;
               try {
                 body = await readBody(req);
@@ -3760,6 +4413,7 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              if (panelMutationBlocked()) return reply(res, 409, PANEL_BUSY);
               const { plan } = await harvestNow();
               const cap = store.capacity(config);
               const zones = {};
@@ -3782,6 +4436,7 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              if (panelMutationBlocked()) return reply(res, 409, PANEL_BUSY);
               let body;
               try {
                 body = await readBody(req);
@@ -3818,12 +4473,17 @@ export function apply(ctx, rawConfig) {
             try {
               if (req.method === 'GET') {
                 await loadPromise;
-                return reply(res, 200, {
-                  ok: true,
-                  settings: settingsSnapshot(),
-                  mirror: mirrorPanelState(),
-                  tokens: tokenUsage(store.zones, config, Date.now()),
-                });
+                // 同 /state：读类明确只看当前激活分区（同步包一层，固化期间也不会跑偏）
+                return reply(
+                  res,
+                  200,
+                  usingSpace(activeSpaceId, () => ({
+                    ok: true,
+                    settings: settingsSnapshot(),
+                    mirror: mirrorPanelState(),
+                    tokens: tokenUsage(store.zones, config, Date.now()),
+                  })),
+                );
               }
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 GET / POST' });
               let body;
@@ -3849,6 +4509,7 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              if (panelMutationBlocked()) return reply(res, 409, PANEL_BUSY);
               await loadPromise;
               // 手动触发就等它跑完 —— 用户点了按钮，要看到结果
               const r = await reclaimForTotalBudget(abort.signal);
@@ -3904,7 +4565,17 @@ export function apply(ctx, rawConfig) {
               if (!isValidSpaceId(id)) return reply(res, 400, { ok: false, error: `分区 id 不合法：${id}` });
               const known = (spaceInfo.spaces ?? []).map((sp) => sp.id);
               if (!known.includes(id)) return reply(res, 400, { ok: false, error: `没有这个分区：${id}` });
+              // BOT 分区锁：其他对话不许手动挂进 Qbot 专区（认出来的 QQ 会话除外）
+              if (botSpaceLockedEffective() && id === botSpaceId() && !isBotSession(sessionId)) {
+                return reply(res, 400, {
+                  ok: false,
+                  error: 'BOT 分区锁开着：其他对话不能挂到 Qbot 专区（要挂就先在面板里把锁关掉）',
+                });
+              }
               bindings[sessionId] = id;
+              // 面板上手动点的绑定 = 他本人的意思，按人话锚定处理，
+              // 不许之后被系统注入或派活事件改回去。
+              anchored[sessionId] = true;
               persistBindings();
               invalidateRender(sessionId);
               return reply(res, 200, { ok: true, sessionId, space: id });
@@ -3962,6 +4633,9 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              // 固化期间不许删：那会儿 opSpaceId 钉在某个分区上，
+              // 把它的目录抽走之后，那条固化链会重新 mkdir 出一个空目录。
+              if (panelMutationBlocked()) return reply(res, 409, PANEL_BUSY);
               let body;
               try {
                 body = await readBody(req);
@@ -3973,9 +4647,10 @@ export function apply(ctx, rawConfig) {
               if (!r.ok) return reply(res, 400, { ok: false, error: r.reason });
               return reply(res, 200, {
                 ok: true,
-                movedTo: r.movedTo,
+                deleted: true,
+                spaceId: r.spaceId,
                 active: r.active,
-                unbound: r.unbound,
+                unmounted: r.unmounted,
                 spaces: spacesPanelList(),
               });
             } catch (err) {
@@ -3998,6 +4673,7 @@ export function apply(ctx, rawConfig) {
               const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
               if (sessionId === '') return reply(res, 400, { ok: false, error: '缺 sessionId' });
               delete bindings[sessionId];
+              delete anchored[sessionId];
               persistBindings();
               invalidateRender(sessionId);
               return reply(res, 200, { ok: true, sessionId });
@@ -4012,6 +4688,7 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              if (panelMutationBlocked()) return reply(res, 409, PANEL_BUSY);
               await loadPromise;
               const r = await runMirrorNow('manual');
               return reply(res, 200, { ...r, mirror: mirrorPanelState() });
@@ -4026,6 +4703,7 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              if (panelMutationBlocked()) return reply(res, 409, PANEL_BUSY);
               await loadPromise;
               // 手动点「立刻自检」就等它跑完 —— 本地算法，毫秒级
               const r = await runDedupNow({ signal: abort.signal, trigger: 'manual' });
@@ -4050,6 +4728,8 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'POST') return reply(res, 405, { ok: false, error: '只支持 POST' });
+              // reload 会 flush + 重读，走的是同一个全局 store 代理 —— 固化期间会落到那个分区上
+              if (panelMutationBlocked()) return reply(res, 409, PANEL_BUSY);
               // 外部工具（比如 tools/import.mjs）改过库文件之后，调一下这个
               const r = await reloadNow();
               return reply(res, 200, { ok: true, ...r });
@@ -4064,6 +4744,7 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             try {
               if (req.method !== 'GET') return reply(res, 405, { ok: false, error: '只支持 GET' });
+              if (panelMutationBlocked()) return reply(res, 409, PANEL_BUSY);
               await loadPromise;
               await drainPromise;
               await store.flush();
@@ -4139,45 +4820,67 @@ export function apply(ctx, rawConfig) {
                   ok: { type: 'boolean' },
                   count: { type: 'integer' },
                   lines: { type: 'array', items: { type: 'string' } },
+                  /** 这次查的是哪个分区（`Workspace（workspace）`）。查不到会话时也写着。 */
+                  space: { type: 'string' },
+                  /** true = 这一局还没挂分区（原分区被删了），什么都没查 */
+                  unmounted: { type: 'boolean' },
                 },
               },
-              render: (_args, value) =>
-                value?.ok === true
-                  ? [
-                      {
-                        type: 'text',
-                        text:
-                          value.count === 0
-                            ? '记忆里没有相关的条目。'
-                            : `找到 ${value.count} 条：\n${(value.lines ?? []).join('\n')}`,
-                      },
-                    ]
-                  : [{ type: 'text', text: '查记忆失败，这次当没想起来。' }],
+              render: (_args, value) => {
+                if (value?.ok !== true) return [{ type: 'text', text: '查记忆失败，这次当没想起来。' }];
+                if (value.unmounted === true) {
+                  return [
+                    {
+                      type: 'text',
+                      text: '这一局还没挂记忆分区（原来那个分区被删了），所以没有可查的记忆。在对话下面那个小标签里选一个分区，选完就恢复。',
+                    },
+                  ];
+                }
+                // 分区一起报出来：串没串当场就看得见，不用两边对账
+                const where =
+                  typeof value.space === 'string' && value.space !== '' ? `（分区：${value.space}）` : '';
+                const text =
+                  value.count === 0
+                    ? `记忆里没有相关的条目${where}。`
+                    : `找到 ${value.count} 条${where}：\n${(value.lines ?? []).join('\n')}`;
+                return [{ type: 'text', text }];
+              },
             },
-            async execute(args) {
+            async execute(args, exec) {
               await loadPromise;
               const query = typeof args?.query === 'string' ? args.query.trim() : '';
               if (query === '') throw new Error('query 不能是空的。');
               const rawTop = Number(args?.top);
-              const top = Number.isFinite(rawTop) ? Math.min(20, Math.max(1, Math.round(rawTop))) : config.recallTop;
-              let hits = [];
-              try {
-                hits = search(store.zones, query, { top, threshold: recallThreshold() }) ?? [];
-              } catch (err) {
-                warn(`memory_search 失败：${err instanceof Error ? err.message : String(err)}`);
-                return { ok: false, count: 0, lines: [] };
+              // 这一局绑在哪个分区，就只查哪个分区（拿不到会话才跟随 active）
+              const where = spaceOfCaller(exec);
+              // 未挂载 → 什么都不查，也别拿 active 的库充数
+              if (where.unmounted === true) {
+                return { ok: true, count: 0, lines: [], space: '未挂载', unmounted: true };
               }
-              touch(hits);
-              const now = Date.now();
-              const lines = hits.map((e) => {
+              const value = usingSpace(where.id, () => {
+                const top = Number.isFinite(rawTop)
+                  ? Math.min(20, Math.max(1, Math.round(rawTop)))
+                  : config.recallTop;
+                let hits = [];
                 try {
-                  return renderEntryLine(e, { now, detailLimit: detailLimitFor(e) });
-                } catch {
-                  return `[${safeStamp(e?.ts)}] ${e?.title ?? ''}`;
+                  hits = search(store.zones, query, { top, threshold: recallThreshold() }) ?? [];
+                } catch (err) {
+                  warn(`memory_search 失败：${err instanceof Error ? err.message : String(err)}`);
+                  return { ok: false, count: 0, lines: [], space: where.label };
                 }
+                touch(hits);
+                const now = Date.now();
+                const lines = hits.map((e) => {
+                  try {
+                    return renderEntryLine(e, { now, detailLimit: detailLimitFor(e) });
+                  } catch {
+                    return `[${safeStamp(e?.ts)}] ${e?.title ?? ''}`;
+                  }
+                });
+                return { ok: true, count: hits.length, lines, space: where.label };
               });
-              log(`memory_search：命中 ${hits.length} 条`);
-              return { ok: true, count: hits.length, lines };
+              log(`memory_search：分区「${where.label}」命中 ${value.count} 条`);
+              return value;
             },
             presentCall: (args) => ({
               card: 'generic',
@@ -4205,6 +4908,10 @@ export function apply(ctx, rawConfig) {
                 properties: {
                   ok: { type: 'boolean' },
                   lines: { type: 'array', items: { type: 'string' } },
+                  /** 这次读的是哪个分区（`Workspace（workspace）`）。 */
+                  space: { type: 'string' },
+                  /** true = 这一局还没挂分区（原分区被删了） */
+                  unmounted: { type: 'boolean' },
                 },
               },
               render: (_args, value) =>
@@ -4212,25 +4919,51 @@ export function apply(ctx, rawConfig) {
                   ? [{ type: 'text', text: (value.lines ?? []).join('\n') }]
                   : [{ type: 'text', text: '读不到记忆容量。' }],
             },
-            async execute() {
+            async execute(_args, exec) {
               await loadPromise;
-              const now = Date.now();
-              const zones = panelZones(now);
-              const lines = [];
-              for (const zone of ZONES) {
-                const z = zones[zone];
-                const pct = z.max > 0 ? Math.round((z.count / z.max) * 100) : 0;
-                let line = `${z.label}：${z.count} / ${z.max}（${pct}%）`;
-                if (typeof z.nextInDays === 'number') line += ` · 最近 ${z.nextInDays} 天后到期`;
-                if (z.expired > 0) line += ` · 已到期 ${z.expired} 条`;
-                lines.push(line);
+              // 这一局绑在哪个分区，就报哪个分区的容量（拿不到会话才跟随 active）
+              const where = spaceOfCaller(exec);
+              // 未挂载 → 不读任何分区，直接说清楚该怎么办
+              if (where.unmounted === true) {
+                return {
+                  ok: true,
+                  lines: [
+                    '这一局还没挂记忆分区（原来那个分区被删了）。',
+                    '在你对话下面那个小标签里选一个分区，选完就恢复读写。',
+                  ],
+                  space: '未挂载',
+                  unmounted: true,
+                };
               }
-              const usage = tokenUsage(store.zones, config, now);
-              // 总量塞进「合计」这一行，不新增行 —— 行数变了会让调用方（和测试）
-              // 对不上号，而这三区 + 合计 + 上次固化 的五行结构是冻结的。
-              lines.push(`合计 ${store.all().length} 条 · 总量 ${tokenText(usage.total)} / ${tokenText(usage.capacity)} token`);
-              lines.push(formatLastAttempt());
-              return { ok: true, lines };
+              const value = usingSpace(where.id, () => {
+                const now = Date.now();
+                const zones = panelZones(now);
+                const lines = [];
+                for (const zone of ZONES) {
+                  const z = zones[zone];
+                  const pct = z.max > 0 ? Math.round((z.count / z.max) * 100) : 0;
+                  let line = `${z.label}：${z.count} / ${z.max}（${pct}%）`;
+                  if (typeof z.nextInDays === 'number') line += ` · 最近 ${z.nextInDays} 天后到期`;
+                  if (z.expired > 0) line += ` · 已到期 ${z.expired} 条`;
+                  lines.push(line);
+                }
+                const usage = tokenUsage(store.zones, config, now);
+                // 总量塞进「合计」这一行 —— 前三区 + 合计 + 上次固化 这五行是冻结的，
+                // 新东西只能往**末尾**加，不许插在中间把老下标顶走。
+                lines.push(`合计 ${store.all().length} 条 · 总量 ${tokenText(usage.total)} / ${tokenText(usage.capacity)} token`);
+                lines.push(formatLastAttempt());
+                // 第六行：到底是哪个分区的数。以前不写，面板写 active=A、这局钉在 B 时
+                // 两边各说各话，模型只能靠猜。
+                lines.push(
+                  where.bound
+                    ? `分区：${where.label}`
+                    : where.inherited
+                      ? `分区：${where.label}（继承派它的那一局）`
+                      : `分区：${where.label}（这局还没绑定分区，按当前激活的分区算）`,
+                );
+                return { ok: true, lines, space: where.label };
+              });
+              return value;
             },
             presentCall: () => ({ card: 'generic', title: '记忆容量', kind: 'other' }),
           }),

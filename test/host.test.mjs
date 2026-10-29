@@ -417,10 +417,11 @@ test('memory_search / memory_stats：手写 schema、命中只回那几条', asy
 
   const stats = await statsTool.execute({});
   assert.equal(stats.ok, true);
-  assert.equal(stats.lines.length, 5, '三区 + 合计 + 上次固化');
+  assert.equal(stats.lines.length, 6, '三区 + 合计 + 上次固化 + 分区');
   assert.match(stats.lines[0], new RegExp(`短期：2 \\/ ${CONFIG_DEFAULTS.shortCapacity}`));
-  // 最后一行回答那个最常见的疑问：「聊了半天，到底记没记？」
+  // 最后两行回答那两个最常见的疑问：「聊了半天，到底记没记？」「这是哪个分区的数？」
   assert.match(stats.lines[4], /^上次固化：/);
+  assert.match(stats.lines[5], /^分区：私生活（private）/);
   assert.match(statsTool.output.render({}, stats)[0].text, /合计 2 条/);
 });
 
@@ -473,7 +474,8 @@ test('固化失败时 memory_stats 能说出原因（不是静默）', async (t)
   const statsTool = statsTools.find((x) => x.name === 'memory_stats');
   if (statsTool === undefined) return; // 这套桩里没注册工具就跳过
   const out = await statsTool.execute({});
-  const last = out.lines[out.lines.length - 1];
+  // 「上次固化」固定在倒数第二行（末尾那行是分区），用下标而不是「最后一行」
+  const last = out.lines[4];
   assert.match(last, /^上次固化：/);
   assert.match(last, /没有可用模型/, last);
 });
@@ -501,6 +503,7 @@ test('HTTP 路由：形状 / 头部 / 8KB 上限 / 405', async (t) => {
 
   const paths = h.routes.map((r) => r.path).sort();
   assert.deepEqual(paths, [
+    '/ebbinghaus/bot-lock',
     '/ebbinghaus/bot-space',
     '/ebbinghaus/compress',
     '/ebbinghaus/dedup',
@@ -1369,6 +1372,24 @@ function makeTwoSpaces(dir, bindings = {}) {
   }
 }
 
+/** 读某个分区三个区的全部条目（核对落点用；坏行直接跳过）。 */
+function readSpaceEntries(dir, spaceId) {
+  const out = [];
+  for (const zone of ['short', 'long', 'permanent']) {
+    const p = path.join(dir, 'spaces', spaceId, `${zone}.jsonl`);
+    if (!existsSync(p)) continue;
+    for (const line of readFileSync(p, 'utf8').split('\n')) {
+      if (line.trim() === '') continue;
+      try {
+        out.push(JSON.parse(line));
+      } catch {
+        // 坏行不算条目
+      }
+    }
+  }
+  return out;
+}
+
 test('多分区：两个会话各写各自的分区，互不串', async (t) => {
   const dir = await tempDir();
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -1420,7 +1441,7 @@ test('多分区：两个会话各写各自的分区，互不串', async (t) => {
   assert.equal(bindings['sess-home'], 'private', '新会话要被钉在当时的 active 上');
 });
 
-test('多分区：切 active 之后，老会话仍留在原分区', async (t) => {
+test('多分区：切 active 之后，老会话仍留在原分区（写入 / 注入 / 工具都不跟走）', async (t) => {
   const dir = await tempDir();
   t.after(() => rm(dir, { recursive: true, force: true }));
   makeTwoSpaces(dir);
@@ -1458,6 +1479,847 @@ test('多分区：切 active 之后，老会话仍留在原分区', async (t) =>
 
   const reg = JSON.parse(readFileSync(path.join(dir, 'spaces.json'), 'utf8'));
   assert.equal(reg.active, 'work', '注册表里的 active 也要跟着改');
+
+  // ① 写入：第二句的记忆还得落在 private，一个字节都不许漏到 work
+  const privateAll = readSpaceEntries(dir, 'private');
+  const workAll = readSpaceEntries(dir, 'work');
+  assert.ok(privateAll.length >= 1, 'private 里要有这局的记忆');
+  assert.equal(workAll.length, 0, '切 active 之后，老会话的记忆不许漏进新激活的分区');
+
+  // ② 注入：这一局的记忆段还从 private 取（不是跟着 active 走）
+  const text = h.sections[0].text();
+  assert.match(text, /<ebbinghaus-memory>/);
+  assert.match(text, /记忆插件/, '老会话的注入里还得有它自己分区的那条');
+
+  // ③ 工具：memory_stats / memory_search 也读老会话绑定的分区
+  const statsTool = (h.tools ?? []).find((x) => x.name === 'memory_stats');
+  const searchTool = (h.tools ?? []).find((x) => x.name === 'memory_search');
+  assert.ok(statsTool && searchTool, '两个工具都要注册');
+  const stats = await statsTool.execute({}, { agent: oldSession });
+  assert.match(stats.lines[5], /^分区：私生活（private）/, '工具要报出老会话的分区，不是 active');
+  const found = await searchTool.execute({ query: '记忆插件', top: 5 }, { agent: oldSession });
+  assert.equal(found.ok, true);
+  assert.ok(found.count >= 1, '老会话的库里应该查得到');
+  assert.match(String(found.space), /私生活（private）/);
+
+  // ④ 与此同时，切换对新会话是生效的：新开一局落在 work
+  const newSession = makeAgent('sess-new', h.sections);
+  h.emit('agent/created', { agent: newSession });
+  h.emit('session/event', { id: 'sess-new' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '新的一局' }] },
+  });
+  h.emit('agent/turn-stopping', { agent: newSession });
+  await h.services.get('ebbinghausMemory').flush();
+  const bindings2 = JSON.parse(readFileSync(path.join(dir, 'space-bindings.json'), 'utf8')).bindings;
+  assert.equal(bindings2['sess-new'], 'work', '新会话要跟着当前的激活分区走');
+  assert.equal(bindings2['sess-old'], 'private', '老会话的绑定一直不许被后来的切换改动');
+});
+
+/* ── 2026-10-29：memory_stats / memory_search 跟着会话走 ──────────────
+   以前这两只工具读的是「当前激活分区」（没有会话上下文时唯一拿得到的东西），
+   于是「面板 active=B、这一局钉在 A」时，模型在 A 这局里问容量，拿回来的是 B
+   的条数和容量 —— 看着就跟串了没区别。现在改成：会话绑哪个分区就查哪个。 */
+
+test('工具跟着会话走：两个分区各看各的，没有会话才跟随 active', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir, { 'sess-w': 'work' });
+
+  const now = Date.now();
+  // 第 1 次固化（sess-w 绑 work）和第 2 次（sess-h 未绑定 → private）给完全不同的内容。
+  // 两条要差得够远：相似度高的两条会互相命中，测出来的「串」是假阳性。
+  const llm = makeLlm((_o, n) =>
+    modelJson([sampleItem(now - 120_000, n === 1 ? '接口超时排查完了' : '早饭吃的包子')]),
+  );
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const w = makeAgent('sess-w', h.sections);
+  h.emit('agent/created', { agent: w });
+  await sayWithSource(h, w, 'sess-w', '那个接口改完了', { kind: 'user' });
+  const home = makeAgent('sess-h', h.sections);
+  h.emit('agent/created', { agent: home });
+  await sayWithSource(h, home, 'sess-h', '今天干点啥', { kind: 'user' });
+
+  const statsTool = (h.tools ?? []).find((x) => x.name === 'memory_stats');
+  const searchTool = (h.tools ?? []).find((x) => x.name === 'memory_search');
+  assert.ok(statsTool && searchTool);
+
+  // ① 绑 work 的会话：只看 work
+  const statsW = await statsTool.execute({}, { agent: w });
+  assert.match(statsW.lines[5], /^分区：工作（work）$/, '工具要报出这局的分区');
+  assert.match(statsW.lines[0], /^短期：1 \//, 'work 里只有它自己那一条');
+  const foundW = await searchTool.execute({ query: '接口超时排查', top: 5 }, { agent: w });
+  assert.equal(foundW.count, 1);
+  assert.match(String(foundW.space), /工作（work）/);
+  const missW = await searchTool.execute({ query: '包子', top: 5 }, { agent: w });
+  assert.equal(missW.count, 0, '别的分区的条目，这边的会话一条都不该看见');
+
+  // ② 绑 private 的会话（它自己第一句话钉的）：只看 private
+  const statsH = await statsTool.execute({}, { agent: home });
+  assert.match(statsH.lines[5], /^分区：私生活（private）$/);
+  const foundH = await searchTool.execute({ query: '包子', top: 5 }, { agent: home });
+  assert.equal(foundH.count, 1);
+  const missH = await searchTool.execute({ query: '接口超时', top: 5 }, { agent: home });
+  assert.equal(missH.count, 0, '反方向也一样，不许互相看见');
+
+  // ③ 完全没有会话上下文（子代理直调 / 测试直调）：跟随 active，且**不落绑定**
+  const before = JSON.parse(readFileSync(path.join(dir, 'space-bindings.json'), 'utf8')).bindings;
+  const statsNone = await statsTool.execute({});
+  assert.match(statsNone.lines[5], /按当前激活的分区算/, '没会话时要把这件事说出来');
+  await searchTool.execute({ query: '任意', top: 3 });
+  const after = JSON.parse(readFileSync(path.join(dir, 'space-bindings.json'), 'utf8')).bindings;
+  assert.deepEqual(after, before, '工具不是人话，不许借工具调用把分区钉下来');
+});
+
+/* ── 2026-10-29：子代理只读、且读派它的那一局的分区 ──────────────────
+   子代理（dsh-subagent / Agent Teams）的会话带着 session.header.parentSession，
+   它不写记忆（两道闸挡着），但**读**的时候必须跟领队看同一个库。
+   旧行为是落到「当前激活分区」—— 领队在 private、这时切了 active 到 work，
+   子代理就会去读 work，等于白干一场。 */
+
+test('子代理：只读不写，而且读的是领队绑定的分区（不是 active）', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir); // active = private，另有 work
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '他在做记忆插件')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  // 领队：说一句 → 钉在 private（当时的 active），写进 private
+  const lead = makeAgent('sess-lead', h.sections);
+  h.emit('agent/created', { agent: lead });
+  await sayWithSource(h, lead, 'sess-lead', '领队的一句话', { kind: 'user' });
+  assert.equal(readBindings(dir)['sess-lead'], 'private');
+  const leadCount = readSpaceEntries(dir, 'private').length;
+  assert.equal(leadCount, 1, '领队应该写进 private');
+
+  // 现在切 active 到 work —— 子代理绝不许被这个切换带跑
+  const res = fakeRes();
+  await h
+    .route('/ebbinghaus/spaces/active')
+    .handler(fakeReq({ method: 'POST', url: '/ebbinghaus/spaces/active', body: { id: 'work' } }), res);
+  assert.equal(res.json().active, 'work');
+
+  // 子代理：带 parentSession 的会话，派给它的第一条也是 kind:'user'。
+  // 注意事件里的 session 对象要带 header —— 真实的 session/event 就是带着的，
+  // 父子关系就靠它认出来（sayWithSource 那个简化版替身不带 header）。
+  const child = makeAgent('sess-child', h.sections, {
+    session: { id: 'sess-child', header: { parentSession: 'sess-lead' } },
+  });
+  h.emit('agent/created', { agent: child });
+  h.emit(
+    'session/event',
+    { id: 'sess-child', header: { parentSession: 'sess-lead' } },
+    {
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: '子代理的任务书' }] },
+    },
+  );
+  h.emit('agent/turn-stopping', { agent: child });
+  await h.services.get('ebbinghausMemory').flush();
+
+  // ① 不写：子代理既不落绑定，也不往任何一个分区写一个字
+  assert.equal(readBindings(dir)['sess-child'], undefined, '子代理不该进绑定表');
+  assert.equal(readSpaceEntries(dir, 'private').length, leadCount, 'private 里不许因它多一条');
+  assert.equal(readSpaceEntries(dir, 'work').length, 0, '更不许写进 work');
+
+  // ② 读：注入段用的还是领队那个库
+  const childSection = h.sections[1];
+  assert.ok(childSection, '子代理也要注册记忆段（否则它读不到任何记忆）');
+  assert.match(childSection.text(), /记忆插件/, '子代理的注入要来自领队的 private');
+
+  // ③ 读：两个工具也走领队的分区，并说明是继承来的
+  const statsTool = (h.tools ?? []).find((x) => x.name === 'memory_stats');
+  const searchTool = (h.tools ?? []).find((x) => x.name === 'memory_search');
+  const stats = await statsTool.execute({}, { agent: child });
+  assert.match(stats.lines[5], /^分区：私生活（private）（继承派它的那一局）$/);
+  assert.match(stats.lines[0], /^短期：1 \//, '读到的仍是 private：1 条，不是 work 的 0 条');
+  const found = await searchTool.execute({ query: '记忆插件', top: 5 }, { agent: child });
+  assert.equal(found.count, 1);
+  assert.match(String(found.space), /私生活（private）/);
+
+  // ④ 面板那个小标签也报「它实际在读哪个库」
+  const chip = fakeRes();
+  await h
+    .route('/ebbinghaus/session-space')
+    .handler(fakeReq({ url: '/ebbinghaus/session-space?session=sess-child' }), chip);
+  assert.equal(chip.json().spaceId, 'private');
+  assert.equal(chip.json().inherited, true);
+});
+
+/* ── 2026-10-29 事故回归：BOM / 注册表读不动 ──────────────────────────
+   那天我用 PowerShell 的 `Set-Content -Encoding utf8` 改了 spaces.json，
+   它给文件头写了个 BOM。`JSON.parse` 直接抛 → 插件兜底成「只有一个默认分区」
+   → 所有指向别的分区的绑定当场失效，全库塌成 private，
+   而面板「分区体检」还写着「分区都读得出来，没问题」。
+   下面三条：BOM 不许再废掉注册表 / 绑定表；读不动时必须让面板看得见。 */
+
+test('BOM：spaces.json 带 BOM 也能正常读（外部编辑器写坏了别塌库）', async (t) => {
+  const dir = await tempDir();
+  makeTwoSpaces(dir); // private(active) + work
+  t.after(async () => {
+    try {
+      await h.services.get('ebbinghausMemory').flush();
+    } catch {
+      // 没到 ready 就算了
+    }
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放，清理失败不影响测试结论
+    }
+  });
+  // 模拟 PowerShell Set-Content / 记事本：文件头多一个 U+FEFF
+  const p = path.join(dir, 'spaces.json');
+  writeFileSync(p, `\uFEFF${readFileSync(p, 'utf8')}`, 'utf8');
+  assert.equal(readFileSync(p, 'utf8').charCodeAt(0), 0xfeff, '前提：文件确实带 BOM');
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const svc = h.services.get('ebbinghausMemory');
+  assert.deepEqual(
+    svc.spaces.list.map((s) => s.id),
+    ['private', 'work'],
+    '两个分区都还要在，不许塌成一个',
+  );
+  assert.equal(svc.spaces.active, 'private', 'active 也要照读出来的算');
+});
+
+test('BOM：space-bindings.json 带 BOM 时，绑定照样生效', async (t) => {
+  const dir = await tempDir();
+  makeTwoSpaces(dir, { 'sess-bom': 'work' });
+  t.after(async () => {
+    try {
+      await h.services.get('ebbinghausMemory').flush();
+    } catch {
+      // 没到 ready 就算了
+    }
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放
+    }
+  });
+
+  const p = path.join(dir, 'space-bindings.json');
+  writeFileSync(p, `\uFEFF${readFileSync(p, 'utf8')}`, 'utf8');
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '绑到 work 的一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const agent = makeAgent('sess-bom', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-bom', '一句话', { kind: 'user' });
+
+  assert.equal(readBindings(dir)['sess-bom'], 'work', '绑定不许因为 BOM 被当成不存在');
+  assert.equal(readSpaceEntries(dir, 'work').length, 1, '记忆要落在绑定的 work 里');
+  assert.equal(readSpaceEntries(dir, 'private').length, 0, '不许掉进 active 的 private');
+});
+
+test('注册表读不动时，面板能看见（不再撒谎说「分区都读得出来」）', async (t) => {
+  const dir = await tempDir();
+  makeTwoSpaces(dir);
+  t.after(async () => {
+    try {
+      await h.services.get('ebbinghausMemory').flush();
+    } catch {
+      // 没到 ready 就算了
+    }
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放
+    }
+  });
+  // 彻底坏掉：连 BOM 都救不了的那种
+  writeFileSync(path.join(dir, 'spaces.json'), '{ 这不是 json', 'utf8');
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+
+  const res = fakeRes();
+  await h.route('/ebbinghaus/state').handler(fakeReq({ url: '/ebbinghaus/state' }), res);
+  const body = res.json();
+
+  // 兜底行为一个字节都没改：仍然是「按单分区继续跑」
+  assert.deepEqual(body.spaces.list.map((s) => s.id), ['private'], '兜底仍是单分区');
+  // 但这次必须说出来
+  assert.ok(Array.isArray(body.spaceProblems), '状态里要有 spaceProblems 字段');
+  assert.ok(
+    body.spaceProblems.some((m) => String(m).includes('spaces.json')),
+    `要把「spaces.json 读不了」摆出来，实际：${JSON.stringify(body.spaceProblems)}`,
+  );
+});
+
+/* ── 2026-10-29：面板操作撞上「正在跑的固化」──
+   固化是异步的（要等模型，几十秒都可能），那段时间全局 opSpaceId 被钉在那个会话的
+   分区上，`store` 代理就跟着它走。于是：面板 HTTP 那条路会作用到别的分区 ——
+   实测症状：面板写着 active=work，点「忘掉」却把 private 那条删了；GET /state
+   也会显示 private 的条数。
+   修法：读类（/state、/settings GET）同步包一层 usingSpace(activeSpaceId)，
+   永远只看当前激活分区；写类（忘掉/收割/压缩/自检/回收/导出/镜像/重读）在固化期间
+   直接回 409「稍后再试」。 */
+
+/** 会一直挂住的 llm：把一次固化悬在「等模型」上（模拟真实的几十秒窗口）。 */
+function makeGatedLlm(text = '[]') {
+  const calls = [];
+  let release;
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  return {
+    calls,
+    release: () => release(),
+    stream(opts) {
+      calls.push(opts);
+      return (async function* gen() {
+        await gate;
+        yield { type: 'text-delta', text };
+        yield { type: 'finish', kind: 'stop' };
+      })();
+    },
+  };
+}
+
+test('固化进行中：面板读的是 active 分区，写类操作被拦成 409（改前会串到别的分区）', async (t) => {
+  const dir = await tempDir();
+  makeTwoSpaces(dir); // active = private，另有 work
+  t.after(async () => {
+    try {
+      await h.services.get('ebbinghausMemory').flush();
+    } catch {
+      // 没到 ready 就算了
+    }
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放
+    }
+  });
+
+  const now = Date.now();
+  const llm = makeLlm({ text: modelJson([sampleItem(now - 60_000, '只该留在 private 的一条')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+  const svc = h.services.get('ebbinghausMemory');
+  await svc.flush();
+
+  // ① 先在 private 里放一条（之后要拿它的 id 去试「忘掉」）
+  const agent = makeAgent('sess-busy', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-busy', '先写一条', { kind: 'user' });
+  const privShort = readSpaceEntries(dir, 'private');
+  assert.equal(privShort.length, 1, '前提：private 里有 1 条');
+  const privId = privShort[0].id;
+
+  // ② 换成会挂住的 llm，切 active 到 work，再让他说一句 → 固化悬在模型调用上
+  const gated = makeGatedLlm();
+  h.services.set('llm', gated);
+  const resSwitch = fakeRes();
+  await h
+    .route('/ebbinghaus/spaces/active')
+    .handler(fakeReq({ method: 'POST', url: '/ebbinghaus/spaces/active', body: { id: 'work' } }), resSwitch);
+  assert.equal(resSwitch.json().active, 'work');
+
+  h.emit('session/event', { id: 'sess-busy' }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第二句，固化会挂住' }] },
+  });
+  h.emit('agent/turn-stopping', { agent });
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(gated.calls.length, 1, '固化要真的悬在模型调用上，这项才有意义');
+
+  // ③ 读类：必须报 work（0 条），不许报 private（1 条）
+  const resState = fakeRes();
+  await h.route('/ebbinghaus/state').handler(fakeReq({ url: '/ebbinghaus/state' }), resState);
+  const st = resState.json();
+  assert.equal(st.ok, true, '读类不能被阻塞（固化每轮都会跑，阻塞会让面板整片报错）');
+  assert.equal(st.spaces.active, 'work');
+  assert.equal(st.zones.short.count, 0, `面板该显示 work 的 0 条，实际 ${st.zones.short.count}`);
+  assert.equal(
+    st.dir.endsWith(`spaces${path.sep}work`) || st.dir.endsWith('spaces/work'),
+    true,
+    `面板给的目录也该是 work：${st.dir}`,
+  );
+
+  // ④ 写类：409，而且那条 private 的记忆一个字节都不许动
+  const resForgetBusy = fakeRes();
+  await h
+    .route('/ebbinghaus/forget')
+    .handler(fakeReq({ method: 'POST', url: '/ebbinghaus/forget', body: { id: privId } }), resForgetBusy);
+  assert.equal(resForgetBusy.statusCode, 409, `固化期间要拦成 409，实际 ${resForgetBusy.statusCode}`);
+  assert.equal(resForgetBusy.json().ok, false);
+  assert.match(String(resForgetBusy.json().error), /正在固化/);
+  assert.ok(
+    readSpaceEntries(dir, 'private').some((e) => e.id === privId),
+    '那条 private 的记忆必须还在（改前会被删掉）',
+  );
+
+  // 同样的闸也要拦住收割 / 压缩 / 自检 / 回收 / 重读 / 镜像 / 导出
+  for (const [p, method, body] of [
+    ['/ebbinghaus/harvest', 'POST', undefined],
+    ['/ebbinghaus/compress', 'POST', { zone: 'short' }],
+    ['/ebbinghaus/dedup', 'POST', undefined],
+    ['/ebbinghaus/reclaim', 'POST', undefined],
+    ['/ebbinghaus/reload', 'POST', undefined],
+    ['/ebbinghaus/mirror', 'POST', undefined],
+    ['/ebbinghaus/export', 'GET', undefined],
+  ]) {
+    const r = fakeRes();
+    await h.route(p).handler(fakeReq({ method, url: p, body }), r);
+    assert.equal(r.statusCode, 409, `${p} 在固化期间也要 409，实际 ${r.statusCode}`);
+  }
+
+  // ⑤ 固化结束之后，闸要放开：同样的请求不再 409，而是回到「按 active 办事」的语义
+  gated.release();
+  await svc.flush();
+  const resAfter = fakeRes();
+  await h
+    .route('/ebbinghaus/forget')
+    .handler(fakeReq({ method: 'POST', url: '/ebbinghaus/forget', body: { id: privId } }), resAfter);
+  assert.equal(resAfter.statusCode, 200, `固化结束后不该再 409，实际 ${resAfter.statusCode}`);
+  assert.equal(resAfter.json().removed, false, '此刻 active=work，private 的 id 在 work 里找不到 → 不该删');
+  assert.ok(
+    readSpaceEntries(dir, 'private').some((e) => e.id === privId),
+    'private 的那条不能被跨分区删掉',
+  );
+
+  // 切回 private 再删 → 这次应该真的删掉（证明闸没把功能堵死）
+  const resBack = fakeRes();
+  await h
+    .route('/ebbinghaus/spaces/active')
+    .handler(fakeReq({ method: 'POST', url: '/ebbinghaus/spaces/active', body: { id: 'private' } }), resBack);
+  const resForgetOk = fakeRes();
+  await h
+    .route('/ebbinghaus/forget')
+    .handler(fakeReq({ method: 'POST', url: '/ebbinghaus/forget', body: { id: privId } }), resForgetOk);
+  assert.equal(resForgetOk.json().removed, true, `切回 private 之后忘掉要成功，响应：${resForgetOk._out?.body ?? ''}`);
+  assert.equal(
+    readSpaceEntries(dir, 'private').some((e) => e.id === privId),
+    false,
+    '切回 private 之后忘掉要真的删掉',
+  );
+
+  // ⑥ 固化结束后 /state 也要正常
+  const resState2 = fakeRes();
+  await h.route('/ebbinghaus/state').handler(fakeReq({ url: '/ebbinghaus/state' }), resState2);
+  assert.equal(resState2.json().spaces.active, 'private');
+  assert.equal(resState2.json().zones.short.count, 0);
+});
+
+/* ── 2026-10-29：自检进度按分区各记一份 ─────────────────────────────
+   原来是单份全局：启动时从 dataDir（=当时的 active）读一次，之后永远写回 dataDir，
+   而 dataDir 跟着 active 变 —— 切一次分区，另一个分区的进度就被写进这个分区的文件。
+   实测证据：private 和 workspace 两个 dedup-state.json 除了 entriesSinceCheck 全同。 */
+
+test('自检进度按分区各记一份（切分区不再互相污染）', async (t) => {
+  const dir = await tempDir();
+  makeTwoSpaces(dir); // active = private，另有 work
+  t.after(async () => {
+    try {
+      await h.services.get('ebbinghausMemory').flush();
+    } catch {
+      // 没到 ready 就算了
+    }
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放
+    }
+  });
+
+  const now = Date.now();
+  const llm = makeLlm((_o, n) => modelJson([sampleItem(now - 60_000, `第${n}条记忆`)]));
+  const h = makeCtx(llm);
+  // 阈值拉大：只考核「账记在哪本上」，不真跑自检
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1, dedupEnabled: true, dedupEveryEntries: 900 });
+
+  const dedupOf = (sp) => {
+    const p = path.join(dir, 'spaces', sp, 'dedup-state.json');
+    try {
+      return JSON.parse(readFileSync(p, 'utf8'));
+    } catch {
+      return null;
+    }
+  };
+
+  // ① A 在 private 写一条 → private 的账 +1，work 还是 0
+  const A = makeAgent('sess-dedup', h.sections);
+  h.emit('agent/created', { agent: A });
+  await sayWithSource(h, A, 'sess-dedup', '私生活的第一条', { kind: 'user' });
+  assert.equal(dedupOf('private')?.entriesSinceCheck, 1, 'private 的进度要 +1');
+  assert.equal(dedupOf('work')?.entriesSinceCheck ?? 0, 0, 'work 的账不该被动到');
+
+  // ② 切 active 到 work，B 在 work 写一条 → work 的账 +1，private 保持 1
+  const resSwitch = fakeRes();
+  await h
+    .route('/ebbinghaus/spaces/active')
+    .handler(fakeReq({ method: 'POST', url: '/ebbinghaus/spaces/active', body: { id: 'work' } }), resSwitch);
+  assert.equal(resSwitch.json().active, 'work');
+  const B = makeAgent('sess-dedup2', h.sections);
+  h.emit('agent/created', { agent: B });
+  await sayWithSource(h, B, 'sess-dedup2', '工作区的第一条', { kind: 'user' });
+  assert.equal(dedupOf('work')?.entriesSinceCheck, 1, 'work 的进度要 +1');
+  assert.equal(dedupOf('private')?.entriesSinceCheck, 1, 'private 的账不许被 work 那次写到');
+
+  // ③ active 已是 work，A 仍在 private 写一条 → 记到 private 那本上（跟着会话的分区）
+  await sayWithSource(h, A, 'sess-dedup', '私生活的第二条', { kind: 'user' });
+  assert.equal(dedupOf('private')?.entriesSinceCheck, 2, 'private 该是 2');
+  assert.equal(dedupOf('work')?.entriesSinceCheck, 1, 'work 该还是 1（改前会跟着写成 3）');
+
+  // ④ 面板/服务给的是「当前激活分区」那本账
+  const svc = h.services.get('ebbinghausMemory');
+  assert.equal(svc.dedupState().entriesSinceCheck, 1, '这时 active=work，服务该给 work 那本（1）');
+  assert.equal(svc.state().dedup?.pending, 1, '面板的 pending 也该是 work 的 1');
+});
+
+/* ── 2026-10-29：删分区的三条硬规矩 ─────────────────────────────────
+   ① Qbot 指定的分区不许删；② 删完必须还剩一个「非 Qbot 分区」（新会话仍会落到 active）；
+   ③ 挂在被删分区上的会话变成「未挂载」：不回落 active，等他手动挑一个分区挂上去。 */
+
+test('删分区：Qbot 指定的不许删，删完必须还剩一个非 Qbot 分区', async (t) => {
+  const dir = await tempDir();
+  makeTwoSpaces(dir); // private(active) + work
+  t.after(async () => {
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放
+    }
+  });
+
+  const llm = makeLlm({ text: modelJson([]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1, botSpaceEnabled: true, botSpaceId: 'private', botUins: '' });
+  await h.services.get('ebbinghausMemory').flush();
+
+  // ① Qbot 专区：不许删
+  const delBot = await callPost(h, '/ebbinghaus/spaces/delete', { id: 'private' });
+  assert.equal(delBot.status, 400, `删 Qbot 专区必须被拒，实际 ${delBot.status}`);
+  assert.match(String(delBot.body.error), /Qbot/, '理由要说清是 Qbot 专区');
+  assert.equal(existsSync(path.join(dir, 'spaces', 'private')), true, '目录一个字节都不该动');
+
+  // ② 删完只剩 Qbot 专区 → 也不许（否则新会话会写进 QQ 那个库）
+  const delLast = await callPost(h, '/ebbinghaus/spaces/delete', { id: 'work' });
+  assert.equal(delLast.status, 400, `只剩 Qbot 分区时必须拒绝，实际 ${delLast.status}`);
+  assert.match(String(delLast.body.error), /Qbot|QQ/);
+  assert.equal(existsSync(path.join(dir, 'spaces', 'work')), true, 'work 也不该被删');
+
+  // 面板要能看出哪个是 Qbot 专区（前端靠这个禁用删除按钮）
+  const resState = fakeRes();
+  await h.route('/ebbinghaus/state').handler(fakeReq({ url: '/ebbinghaus/state' }), resState);
+  const rows = resState.json().spaces.list;
+  assert.equal(rows.find((s) => s.id === 'private')?.bot, true, 'private 要标成 bot');
+  assert.equal(rows.find((s) => s.id === 'work')?.bot, false, 'work 不该标成 bot');
+});
+
+test('删分区：删的是 active 时，切到非 Qbot 分区里最新创建的那个', async (t) => {
+  const dir = await tempDir();
+  t.after(async () => {
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放
+    }
+  });
+  // 三个分区：private(active) / work / qqzone（Qbot 专区）。work 比 private 新，qqzone 最老。
+  for (const id of ['private', 'work', 'qqzone']) mkdirSync(path.join(dir, 'spaces', id), { recursive: true });
+  const nowIso = Date.now();
+  writeFileSync(
+    path.join(dir, 'spaces.json'),
+    `${JSON.stringify(
+      {
+        version: 1,
+        active: 'private',
+        spaces: [
+          { id: 'qqzone', name: 'QQ 专区', createdAt: new Date(nowIso - 9000).toISOString() },
+          { id: 'private', name: '私生活', createdAt: new Date(nowIso - 6000).toISOString() },
+          { id: 'work', name: '工作', createdAt: new Date(nowIso - 3000).toISOString() },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
+
+  const llm = makeLlm({ text: modelJson([]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1, botSpaceEnabled: true, botSpaceId: 'qqzone', botUins: '' });
+  await h.services.get('ebbinghausMemory').flush();
+
+  // 新建一个「最新」的分区
+  const created = await callPost(h, '/ebbinghaus/spaces/create', { name: '最新区' });
+  assert.equal(created.body.ok, true, JSON.stringify(created.body));
+  const newestId = created.body.space.id;
+
+  // private 是 active，删掉它 → active 应该切到「非 bot 里最新创建」= newestId（不是 work、不是 qqzone）
+  const del = await callPost(h, '/ebbinghaus/spaces/delete', { id: 'private' });
+  assert.equal(del.status, 200, JSON.stringify(del.body));
+  assert.equal(del.body.active, newestId, `删掉 active 后要切到最新创建的非 Qbot 分区，实际 ${del.body.active}`);
+  const reg2 = JSON.parse(readFileSync(path.join(dir, 'spaces.json'), 'utf8'));
+  assert.equal(reg2.active, newestId);
+});
+
+test('删分区：挂在上面的会话变未挂载（不回落 active），挂回去就恢复', async (t) => {
+  const dir = await tempDir();
+  makeTwoSpaces(dir); // private(active) + work
+  t.after(async () => {
+    try {
+      await h.services.get('ebbinghausMemory').flush();
+    } catch {
+      // 没到 ready 就算了
+    }
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放
+    }
+  });
+
+  const now = Date.now();
+  const llm = makeLlm((_o, n) => modelJson([sampleItem(now - 60_000, n === 1 ? '私生活的老记忆' : '删完之后的新记忆')]));
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1 });
+  const svc = h.services.get('ebbinghausMemory');
+  await svc.flush();
+
+  // ① 会话先绑在 private 并写一条
+  const agent = makeAgent('sess-gone', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-gone', '第一句', { kind: 'user' });
+  assert.equal(readBindings(dir)['sess-gone'], 'private');
+  assert.equal(readSpaceEntries(dir, 'private').length, 1);
+
+  // ② 把 private 删掉（真删）
+  const del = await callPost(h, '/ebbinghaus/spaces/delete', { id: 'private' });
+  assert.equal(del.status, 200, JSON.stringify(del.body));
+  assert.equal(del.body.unmounted, 1, '要报出有几个会话变成未挂载');
+  assert.equal(existsSync(path.join(dir, 'spaces', 'private')), false, '目录要被真删');
+  assert.equal(readBindings(dir)['sess-gone'], '', '绑定要记成空串（显式未挂载），不是删掉');
+
+  // ③ 这局再说话 → 一个分区都不许写（尤其不许写进刚变成 active 的 work）
+  await sayWithSource(h, agent, 'sess-gone', '第二句', { kind: 'user' });
+  assert.equal(readSpaceEntries(dir, 'work').length, 0, '未挂载的会话不许写进 active 的 work');
+
+  // ④ 注入整段不出
+  assert.equal(String(h.sections[0].text()), '', '未挂载时不该注入任何记忆');
+
+  // ⑤ 工具要说清楚「没挂分区」，而不是拿 active 的库充数
+  const statsTool = h.tools.find((x) => x.name === 'memory_stats');
+  const searchTool = h.tools.find((x) => x.name === 'memory_search');
+  const stats = await statsTool.execute({}, { agent });
+  assert.match(stats.lines.join('\n'), /还没挂记忆分区/);
+  assert.equal(stats.space, '未挂载');
+  const found = await searchTool.execute({ query: '记忆', top: 3 }, { agent });
+  assert.equal(found.unmounted, true);
+
+  // ⑥ 小标签接口：报未挂载 + 给出可选分区，前端靠它渲染下拉
+  const chip = fakeRes();
+  await h
+    .route('/ebbinghaus/session-space')
+    .handler(fakeReq({ url: '/ebbinghaus/session-space?session=sess-gone' }), chip);
+  assert.equal(chip.json().unmounted, true);
+  assert.equal(chip.json().spaceId, '');
+  assert.deepEqual(
+    chip.json().spaces.map((s) => s.id),
+    ['work'],
+    '要把它能挂的分区列表给出来',
+  );
+
+  // ⑦ 挂到 work 上 → 恢复读写
+  const bind = await callPost(h, '/ebbinghaus/spaces/bind', { sessionId: 'sess-gone', id: 'work' });
+  assert.equal(bind.status, 200, JSON.stringify(bind.body));
+  assert.equal(readBindings(dir)['sess-gone'], 'work');
+  await sayWithSource(h, agent, 'sess-gone', '第三句', { kind: 'user' });
+  assert.equal(readSpaceEntries(dir, 'work').length, 1, '挂回去之后记忆要落进 work');
+  const stats2 = await statsTool.execute({}, { agent });
+  assert.match(String(stats2.lines[stats2.lines.length - 1]), /工作（work）/);
+});
+
+/* ── 2026-10-29：BOT 分区锁（默认打开，只在装了 qq-bot 时才有意义）──
+   打开后：桌面会话不落进 Qbot 专区、不能手动挂进去、已经挂着的被打成未挂载；
+   QQ 会话照旧；面板的管理入口（浏览/导出/体检/恢复）不受影响。
+   「当前记忆分区」仍允许指到专区（用来查看），只是新会话不会落进去。 */
+
+/** 建一个「private 是 Qbot 专区（active）+ work」的库，createdAt 明确排序。 */
+function makeBotLib(dir, extraBindings = {}) {
+  for (const id of ['private', 'work']) mkdirSync(path.join(dir, 'spaces', id), { recursive: true });
+  const now = Date.now();
+  writeFileSync(
+    path.join(dir, 'spaces.json'),
+    `${JSON.stringify(
+      {
+        version: 1,
+        active: 'private',
+        spaces: [
+          { id: 'private', name: '私生活', createdAt: new Date(now - 6000).toISOString() },
+          { id: 'work', name: '工作', createdAt: new Date(now - 3000).toISOString() },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
+  writeFileSync(
+    path.join(dir, 'bot-space.json'),
+    `${JSON.stringify({ version: 1, spaceId: 'private', lockedAt: now, seenUins: {} }, null, 2)}\n`,
+    'utf8',
+  );
+  if (Object.keys(extraBindings).length > 0) {
+    writeFileSync(
+      path.join(dir, 'space-bindings.json'),
+      JSON.stringify({ version: 1, bindings: extraBindings }),
+      'utf8',
+    );
+  }
+}
+
+test('BOT 分区锁（默认开）：桌面会话被移出专区、不落进去、也挂不进去；QQ 不受影响', async (t) => {
+  const dir = await tempDir();
+  // 预置一个「历史遗留、绑在专区上的桌面会话」—— 锁打开时它要被移出
+  makeBotLib(dir, { 'sess-old': 'private' });
+  t.after(async () => {
+    try {
+      await h.services.get('ebbinghausMemory').flush();
+    } catch {
+      // 没到 ready 就算了
+    }
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放
+    }
+  });
+
+  const now = Date.now();
+  const llm = makeLlm((_o, n) => modelJson([sampleItem(now - 60_000, n === 1 ? 'QQ 的一条' : '桌面上的一条')]));
+  const h = makeCtx(llm);
+  host.apply(h.ctx, { dataDir: dir, writeEveryTurns: 1, botSpaceEnabled: true, botUins: '' });
+  const svc = h.services.get('ebbinghausMemory');
+  await svc.flush();
+
+  // ① 启动时：历史绑定被移出（变成显式未挂载）
+  assert.equal(readBindings(dir)['sess-old'], '', '锁打开时，挂在专区上的非 QQ 会话要变成未挂载');
+  const resS0 = fakeRes();
+  await h.route('/ebbinghaus/state').handler(fakeReq({ url: '/ebbinghaus/state' }), resS0);
+  assert.equal(resS0.json().botSpace.lockEffective, true, '锁应当生效（装了 bot + 选区 + 默认打开）');
+
+  // ② 新桌面会话：不落进专区，落到非 bot 里最新的 work
+  const desk = makeAgent('sess-desk', h.sections);
+  h.emit('agent/created', { agent: desk });
+  await sayWithSource(h, desk, 'sess-desk', '桌面上的一句话', { kind: 'user' });
+  assert.equal(readBindings(dir)['sess-desk'], 'work', '桌面新会话要落到非 bot 分区');
+  assert.equal(readSpaceEntries(dir, 'private').length, 0, '专区里不许有桌面会话的记忆');
+  assert.equal(readSpaceEntries(dir, 'work').length, 1);
+
+  // ③ active 允许切到专区（他要能查看），但新会话仍然不落进去
+  const resAct = fakeRes();
+  await h
+    .route('/ebbinghaus/spaces/active')
+    .handler(fakeReq({ method: 'POST', url: '/ebbinghaus/spaces/active', body: { id: 'private' } }), resAct);
+  assert.equal(resAct.statusCode, 200, '锁打开也允许把 active 指到专区（仅查看）');
+  const desk2 = makeAgent('sess-desk2', h.sections);
+  h.emit('agent/created', { agent: desk2 });
+  await sayWithSource(h, desk2, 'sess-desk2', '再开一局', { kind: 'user' });
+  assert.equal(readBindings(dir)['sess-desk2'], 'work', 'active 指着专区时，新会话也要改落非 bot 分区');
+
+  // ④ 手动挂到专区：被拒
+  const bind = await callPost(h, '/ebbinghaus/spaces/bind', { sessionId: 'sess-desk', id: 'private' });
+  assert.equal(bind.status, 400, `挂在专区上必须被拒，实际 ${bind.status}`);
+  assert.match(String(bind.body.error), /BOT 分区锁/);
+
+  // ⑤ QQ 会话：照旧进专区，而且会被认出来（所以锁不会把它踢掉）
+  const qq = makeAgent('sess-qq-lock', h.sections);
+  h.emit('agent/created', { agent: qq });
+  await sayWithSource(h, qq, 'sess-qq-lock', 'QQ 的一句话', { kind: 'qq', uin: '123456789' });
+  assert.equal(readBindings(dir)['sess-qq-lock'], 'private', 'QQ 会话要进专区');
+  assert.equal(readSpaceEntries(dir, 'private').length, 1, 'QQ 的记忆要落在专区');
+  const fileAfter = JSON.parse(readFileSync(path.join(dir, 'bot-space.json'), 'utf8'));
+  assert.ok(
+    Array.isArray(fileAfter.sessions) && fileAfter.sessions.includes('sess-qq-lock'),
+    'QQ 会话要被记进 bot-space.json 的 sessions',
+  );
+
+  // ⑥ 关掉锁 → 桌面会话又能落进专区了（选择权在他）
+  const off = await callPost(h, '/ebbinghaus/bot-lock', { locked: false });
+  assert.equal(off.status, 200, JSON.stringify(off.body));
+  assert.equal(off.body.lockForeign, false);
+  const desk3 = makeAgent('sess-desk3', h.sections);
+  h.emit('agent/created', { agent: desk3 });
+  await sayWithSource(h, desk3, 'sess-desk3', '关锁之后的一句', { kind: 'user' });
+  assert.equal(readBindings(dir)['sess-desk3'], 'private', '关掉锁之后，桌面会话可以落回 active（专区）');
+});
+
+test('BOT 分区锁：没装 bot / 没选专区 / 专区指向不存在的分区 —— 一律不生效也不报错', async (t) => {
+  const dir = await tempDir();
+  makeTwoSpaces(dir); // private(active) + work，没有 bot-space.json
+  t.after(async () => {
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // Windows 上偶尔句柄还没释放
+    }
+  });
+
+  const now = Date.now();
+  const llm = makeLlm(() => modelJson([sampleItem(now - 60_000, '一句')]));
+
+  // ① 全新库 + 没装 bot：apply 不抛，锁不生效，桌面会话照常跟着 active
+  const h1 = makeCtx(llm);
+  host.apply(h1.ctx, { dataDir: dir, writeEveryTurns: 1 });
+  await h1.services.get('ebbinghausMemory').flush();
+  const res1 = fakeRes();
+  await h1.route('/ebbinghaus/state').handler(fakeReq({ url: '/ebbinghaus/state' }), res1);
+  assert.equal(res1.json().ok, true, '没装 bot 时面板也要正常');
+  assert.equal(res1.json().botSpace.lockEffective, false, '没装 bot → 锁不生效');
+  assert.equal(res1.json().botSpace.lockForeign, true, '开关本身默认仍是「打开」');
+  const a1 = makeAgent('sess-nobot', h1.sections);
+  h1.emit('agent/created', { agent: a1 });
+  await sayWithSource(h1, a1, 'sess-nobot', '一句', { kind: 'user' });
+  assert.equal(readBindings(dir)['sess-nobot'], 'private', '没装 bot 时照常落 active');
+
+  // ② 装了 bot 但没选专区 → 锁同样不生效
+  const dir2 = await tempDir();
+  makeTwoSpaces(dir2);
+  t.after(() => rm(dir2, { recursive: true, force: true, maxRetries: 5 }).catch(() => {}));
+  const h2 = makeCtx(llm);
+  host.apply(h2.ctx, { dataDir: dir2, writeEveryTurns: 1, botSpaceEnabled: true });
+  await h2.services.get('ebbinghausMemory').flush();
+  const res2 = fakeRes();
+  await h2.route('/ebbinghaus/state').handler(fakeReq({ url: '/ebbinghaus/state' }), res2);
+  assert.equal(res2.json().botSpace.lockEffective, false, '没选专区 → 锁不生效');
+
+  // ③ 专区指向一个不存在的分区 → 锁也不生效，且不炸
+  const dir3 = await tempDir();
+  makeTwoSpaces(dir3);
+  t.after(() => rm(dir3, { recursive: true, force: true, maxRetries: 5 }).catch(() => {}));
+  writeFileSync(
+    path.join(dir3, 'bot-space.json'),
+    `${JSON.stringify({ version: 1, spaceId: 'gone', lockedAt: Date.now(), seenUins: {} }, null, 2)}\n`,
+    'utf8',
+  );
+  const h3 = makeCtx(llm);
+  host.apply(h3.ctx, { dataDir: dir3, writeEveryTurns: 1, botSpaceEnabled: true, botUins: '' });
+  await h3.services.get('ebbinghausMemory').flush();
+  const res3 = fakeRes();
+  await h3.route('/ebbinghaus/state').handler(fakeReq({ url: '/ebbinghaus/state' }), res3);
+  assert.equal(res3.json().ok, true, '专区不存在也不能炸');
+  assert.equal(res3.json().botSpace.lockEffective, false, '专区不存在 → 锁不生效');
+  const a3 = makeAgent('sess-gone-space', h3.sections);
+  h3.emit('agent/created', { agent: a3 });
+  await sayWithSource(h3, a3, 'sess-gone-space', '一句', { kind: 'user' });
+  assert.equal(readBindings(dir3)['sess-gone-space'], 'private', '专区不存在时，会话照常落 active');
 });
 
 /* ─────────────────── 分区管理：新建 / 改名 / 删除 ─────────────────── */
@@ -1518,12 +2380,9 @@ test('分区管理：新建 / 改名 / 删除', async (t) => {
   assert.equal(del1.status, 400, '最后一个不许删');
   assert.match(String(del1.body.error), /至少|留一个/);
 
-  // ④ 删掉的目录搬进 _trash（不真删）
-  const trash = path.join(dir, '_trash');
-  assert.equal(existsSync(trash), true, '要建 _trash');
-  const moved = readdirSync(trash);
-  assert.equal(moved.length, 1, '搬过去一份');
-  assert.ok(String(moved[0]).startsWith('private'), '被删的是 private，_trash 里的目录名要带它的 id');
+  // ④ 删掉的分区是**真删**：目录不在了，也不再往 _trash 里搬（2026-10-29 改）
+  assert.equal(existsSync(path.join(dir, 'spaces', 'private')), false, 'private 目录要被真删');
+  assert.equal(existsSync(path.join(dir, '_trash')), false, '真删之后不该再建 _trash');
 });
 
 test('分区管理：新建超过 10 个会被拒', async (t) => {
@@ -1654,7 +2513,7 @@ test('QQ 转进来的消息也能触发固化（source.kind = qq）', async (t) 
   // dsh-qq-bot 造的消息：source.kind 是 'qq'，不是 'user'（见它的 SOURCE_KIND）
   h.emit('session/event', { id: 'sess-qq' }, {
     type: 'user/message',
-    data: { source: { kind: 'qq', uin: '3448932873' }, content: [{ type: 'text', text: '在吗' }] },
+    data: { source: { kind: 'qq', uin: '123456789' }, content: [{ type: 'text', text: '在吗' }] },
   });
   h.emit('agent/turn-stopping', { agent });
   await h.services.get('ebbinghausMemory').flush();
@@ -1711,13 +2570,14 @@ test('连续失败会在 memory_stats 里带 ⚠ 提示（单次失败时不带�
   await runOnce('第一轮');
   if (statsTool === undefined) return; // 桩里没注册工具就跳过
   let out = await statsTool.execute({});
-  let last = out.lines[out.lines.length - 1];
+  // 「上次固化」固定在第 5 行（下标 4）；最后一行是分区
+  let last = out.lines[4];
   assert.match(last, /^上次固化：/);
   assert.doesNotMatch(last, /连续/, '只失败一次不给警告，免得和「没到该记的时候」混淆');
 
   await runOnce('第二轮');
   out = await statsTool.execute({});
-  last = out.lines[out.lines.length - 1];
+  last = out.lines[4];
   assert.match(last, /已连续 2 次没写进去/, '连续失败必须显式说出来');
 });
 
@@ -2044,12 +2904,12 @@ test('bot 专区：开关开着 + 号对得上 → 会话绑到指定分区', as
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '3448932873',
+    botUins: '123456789',
   });
 
   const agent = makeAgent('sess-bot', h.sections);
   h.emit('agent/created', { agent });
-  await sayWithSource(h, agent, 'sess-bot', '在吗', { kind: 'qq', uin: '3448932873' });
+  await sayWithSource(h, agent, 'sess-bot', '在吗', { kind: 'qq', uin: '123456789' });
 
   assert.equal(readBindings(dir)['sess-bot'], 'work', 'QQ 会话要绑到 bot 专区');
 });
@@ -2066,7 +2926,7 @@ test('bot 专区：号不在名单里 / 开关关着 → 还是跟着默认分�
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '3448932873',
+    botUins: '123456789',
   });
 
   const agent = makeAgent('sess-other', h.sections);
@@ -2115,7 +2975,7 @@ test('bot 专区：会话先被不带 source 的事件建出来 → 第一条 QQ
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '3448932873',
+    botUins: '123456789',
   });
 
   const agent = makeAgent('sess-pre', h.sections);
@@ -2124,7 +2984,7 @@ test('bot 专区：会话先被不带 source 的事件建出来 → 第一条 QQ
   h.emit('session/event', { id: 'sess-pre' }, { type: 'session/opened', data: {} });
   assert.equal(readBindings(dir)['sess-pre'], undefined, '没带 source 的事件不许建绑定');
 
-  await sayWithSource(h, agent, 'sess-pre', '在吗', { kind: 'qq', uin: '3448932873' });
+  await sayWithSource(h, agent, 'sess-pre', '在吗', { kind: 'qq', uin: '123456789' });
   assert.equal(readBindings(dir)['sess-pre'], 'work', '第一条 QQ 消息要把会话绑到专区');
 });
 
@@ -2140,12 +3000,12 @@ test('bot 专区：已经被钉到别的分区的 QQ 会话，下一条消息改
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '3448932873',
+    botUins: '123456789',
   });
 
   const agent = makeAgent('sess-wrong', h.sections);
   h.emit('agent/created', { agent });
-  await sayWithSource(h, agent, 'sess-wrong', '在吗', { kind: 'qq', uin: '3448932873' });
+  await sayWithSource(h, agent, 'sess-wrong', '在吗', { kind: 'qq', uin: '123456789' });
 
   assert.equal(readBindings(dir)['sess-wrong'], 'work', '锁定分区优先于历史错绑定');
 });
@@ -2184,7 +3044,7 @@ test('bot 专区：qq-bot 派的活（kind=dsh-qq-bot、不带 uin）也算桥�
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '3448932873', // 设了号也不该把「没号的任务消息」挡在外面
+    botUins: '123456789', // 设了号也不该把「没号的任务消息」挡在外面
   });
 
   const agent = makeAgent('sess-task', h.sections);
@@ -2213,7 +3073,7 @@ test('bot 专区：带了别的号 → 不拦到专区', async (t) => {
     writeEveryTurns: 1,
     botSpaceEnabled: true,
     botSpaceId: 'work',
-    botUins: '3448932873',
+    botUins: '123456789',
   });
 
   const agent = makeAgent('sess-stranger', h.sections);
@@ -2281,7 +3141,7 @@ test('装了 dsh-qq-bot 时：开关写 false 也强制开，QQ 会话照样进�
 
   const agent = makeAgent('sess-lock', h.sections);
   h.emit('agent/created', { agent });
-  await sayWithSource(h, agent, 'sess-lock', '在吗', { kind: 'qq', uin: '3448932873' });
+  await sayWithSource(h, agent, 'sess-lock', '在吗', { kind: 'qq', uin: '123456789' });
 
   assert.equal(readBindings(dir)['sess-lock'], 'work', '装了 QQ bot 就不允许关专区');
 
@@ -2357,5 +3217,188 @@ test('镜像同步：每个分区各写一份，不是只写当前激活那个',
   assert.ok(
     existsSync(path.join(mirrorDir, 'work', 'library')),
     'work 的 library 要落到自己的目录里',
+  );
+});
+
+/* ── 2026-10-29：分区锁定被系统注入改写 ────────────────────────────────
+   DSH 在他说完一句话之后会接着追发 `runtime-context` / `skill-catalog` /
+   `time-context`，它们也是 `user/message` 事件。旧逻辑只把 `user` 排除在
+   「桥接」之外，于是这三条被判成 QQ 那种外接来源 → 命中 bot 专区 →
+   走「例外改绑」→ 把刚钉好的分区当场改走。
+   实测症状：一句话说完 6 秒内，注入从 workspace 变成 private，
+   而面板上 active 还写着 workspace。
+   下面这组测试钉住修复后的行为：**只有人话能钉、也只有人能改。 */
+
+/** 读整个绑定文件（要连 locked 一起看）。 */
+function readBindingFile(dir) {
+  try {
+    return JSON.parse(readFileSync(path.join(dir, 'space-bindings.json'), 'utf8'));
+  } catch {
+    return { bindings: {}, locked: {} };
+  }
+}
+
+/** DSH 追发的那三条系统上下文，按真实顺序灌进去。 */
+function pumpSystemContext(h, sessionId) {
+  for (const kind of ['runtime-context', 'skill-catalog', 'time-context']) {
+    h.emit('session/event', { id: sessionId }, {
+      type: 'user/message',
+      data: { source: { kind }, content: [{ type: 'text', text: `[${kind}]` }] },
+    });
+  }
+}
+
+test('分区锁定：系统注入不许把刚钉好的分区改走（2026-10-29 回归）', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir); // active=private，另有 work
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    // 和真实环境一致：装着 qq-bot → 专区强制开启，且钉在 work 上。
+    // 注意 botUins 非空：系统上下文不带 uin，正好会撞进「没号不拦」那条。
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '123456789',
+  });
+
+  const agent = makeAgent('sess-lock1', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-lock1', '第一句话', { kind: 'user' });
+  assert.equal(readBindings(dir)['sess-lock1'], 'private', '第一句人话钉在当时的 active 上');
+
+  pumpSystemContext(h, 'sess-lock1');
+  const file = readBindingFile(dir);
+  assert.equal(file.bindings['sess-lock1'], 'private', '系统注入不许改绑');
+  assert.equal(file.locked['sess-lock1'], true, '人话钉过的绑定要被标成已锚定');
+});
+
+test('分区锁定：一句话 + 一串系统注入 + 再说话，全程钉在同一个分区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir);
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '123456789',
+  });
+
+  const agent = makeAgent('sess-lock2', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-lock2', '第一句', { kind: 'user' });
+  assert.equal(readBindings(dir)['sess-lock2'], 'private');
+
+  // 第二轮：他说一句 → 系统追三条 → 回合结束固化
+  pumpSystemContext(h, 'sess-lock2');
+  await sayWithSource(h, agent, 'sess-lock2', '第二句', { kind: 'user' });
+  pumpSystemContext(h, 'sess-lock2');
+
+  assert.equal(readBindings(dir)['sess-lock2'], 'private', '来回两轮都不许被挪走');
+  assert.ok(
+    existsSync(path.join(dir, 'spaces', 'private', 'short.jsonl')),
+    '记忆写在他钉住的那个分区里',
+  );
+  // 而且一条都不许漏到专区去
+  const leaked = existsSync(path.join(dir, 'spaces', 'work', 'short.jsonl'))
+    ? readFileSync(path.join(dir, 'spaces', 'work', 'short.jsonl'), 'utf8').trim()
+    : '';
+  assert.equal(leaked, '', '专区里不该有桌面会话的记忆');
+});
+
+test('分区锁定：系统注入先到时，不许把会话钉进 bot 专区', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir);
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '123456789',
+  });
+
+  // 这一局谁都还没说话，系统上下文先到
+  pumpSystemContext(h, 'sess-lock4');
+  assert.equal(readBindings(dir)['sess-lock4'], 'private', '系统注入按 active 落，不进专区');
+  assert.equal(readBindingFile(dir).locked['sess-lock4'], false, '系统来源钉的绑定不该算锚定');
+
+  // 等插件把手上的异步活干完，否则 t.after 的 rm 会撞上还没关的句柄
+  await h.services.get('ebbinghausMemory').flush();
+});
+
+test('分区锁定：DSH 以后新加的系统来源种类，也改不动已锚定的绑定', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  makeTwoSpaces(dir);
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'work',
+    botUins: '',
+  });
+
+  const agent = makeAgent('sess-lock5', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-lock5', '第一句', { kind: 'user' });
+  assert.equal(readBindings(dir)['sess-lock5'], 'private');
+
+  // 一个我们没预料到的新种类：既不在 INTERNAL_SOURCE_KINDS 里、
+  // 也不在 sourceKinds 白名单里 —— 所以第一道防线会漏，
+  // 必须由第二道（不是人话就没有改绑资格）拦住。
+  h.emit('session/event', { id: 'sess-lock5' }, {
+    type: 'user/message',
+    data: { source: { kind: 'future-harness-injection' }, content: [{ type: 'text', text: 'x' }] },
+  });
+  assert.equal(readBindings(dir)['sess-lock5'], 'private', '第二道防线必须兜住');
+});
+
+test('分区锁定：只有一个分区 + bot 专区指向不存在的分区，不炸也不乱绑', async (t) => {
+  const dir = await tempDir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  mkdirSync(path.join(dir, 'spaces', 'onlyone'), { recursive: true });
+  writeFileSync(
+    path.join(dir, 'spaces.json'),
+    JSON.stringify({
+      version: 1,
+      active: 'onlyone',
+      spaces: [{ id: 'onlyone', name: '唯一的', createdAt: new Date().toISOString() }],
+    }),
+    'utf8',
+  );
+
+  const llm = makeLlm({ text: modelJson([sampleItem(Date.now() - 60_000, '一句')]) });
+  const h = makeCtx(llm);
+  host.apply(h.ctx, {
+    dataDir: dir,
+    writeEveryTurns: 1,
+    botSpaceEnabled: true,
+    botSpaceId: 'does-not-exist', // 社区用户手滑写错 / 分区被删掉
+    botUins: '',
+  });
+
+  const agent = makeAgent('sess-lock6', h.sections);
+  h.emit('agent/created', { agent });
+  await sayWithSource(h, agent, 'sess-lock6', '第一句', { kind: 'user' });
+  pumpSystemContext(h, 'sess-lock6');
+
+  assert.equal(readBindings(dir)['sess-lock6'], 'onlyone', '回落到唯一的分区，而不是报错');
+  assert.ok(
+    existsSync(path.join(dir, 'spaces', 'onlyone', 'short.jsonl')),
+    '记忆照常写进那个分区',
   );
 });

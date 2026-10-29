@@ -113,7 +113,7 @@ test('isValidEntry 拒绝塌掉的字段', () => {
 // 2026-10-27 回归：固化模型不按 ts/title/detail 给字段，正文塞在 content 里。
 // 这条必须一直过 —— 它一旦失效，固化会静默丢满整批，只在 debugLog 里可见。
 test('normalizeEntry 认得模型用的 content 键，不当成空条目丢掉', () => {
-  const raw = { type: 'fact', content: '桌面端记忆插件的 mirror 目录指向 D:/DSH/dsh-home/ebbinghaus-mirror', ts: 1793086189781 };
+  const raw = { type: 'fact', content: '桌面端记忆插件的 mirror 目录指向 D:/path/to/ebbinghaus-mirror', ts: 1793086189781 };
   const e = normalizeEntry(raw, { zone: 'short', now: 1793086189781 });
   assert.notEqual(e, null);
   assert.match(e.detail, /mirror 目录指向/);

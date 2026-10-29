@@ -21,6 +21,7 @@
  */
 
 import { promises as fsp } from 'node:fs';
+import { watch } from 'node:fs';
 import path from 'node:path';
 import { ZONES, isValidEntry, makeId, normalizeEntry } from './schema.mjs';
 import { CONFIG_DEFAULTS } from './config.mjs';
@@ -135,6 +136,27 @@ export function createStore(opts) {
   /** 写盘串行化：后台固化 + 面板删除可能同时触发 */
   let writeChain = Promise.resolve();
 
+  /**
+   * 上一次**我们自己**写进盘的每个分区文本。
+   *
+   * 2026-10-29 加，起因是一次真实事故：外部工具（迁移脚本）刚改完 jsonl，
+   * 插件毫不知情，下一次落盘拿内存里的旧副本整份覆盖 —— 296 条改动当场蒸发，
+   * 磁盘上看不出任何异常。
+   *
+   * 有了这份记录，「磁盘内容和上次自己写的不一样」就等于「有人在外面改了」，
+   * 这时候重读一次即可，不必让用户重启应用。
+   */
+  const lastWritten = new Map();
+
+  /** 外部改动监听的轮询状态（只在这个 store 上有一份）。 */
+  /** 上次看到的每个分区文件 mtime:size —— 变了才去读内容。 */
+  const lastStat = new Map();
+  /** @type {NodeJS.Timeout | null} */
+  let pollTimer = null;
+  /** @type {(() => void) | null} */
+  let watchStop = null;
+  let checking = false;
+
   const store = {
     get dir() {
       return dir;
@@ -185,6 +207,7 @@ export function createStore(opts) {
           const text = await fsp.readFile(file, 'utf8');
           const { entries, bad: n } = parseJsonl(text);
           zones[zone] = entries.map((e) => ({ ...e, zone }));
+          lastWritten.set(zone, text);
           bad += n;
           if (n > 0) warn(`${zone}.jsonl 有 ${n} 行读不出来，已跳过`);
         } catch (err) {
@@ -194,6 +217,7 @@ export function createStore(opts) {
             warn(`${zone}.jsonl 读不了（${err.code ?? '?'}），这一区按空处理`);
           }
           zones[zone] = [];
+          lastWritten.delete(zone);
         }
       }
 
@@ -462,7 +486,9 @@ export function createStore(opts) {
           await this.mergeFromDisk();
           meta = { ...meta, schema: SCHEMA_VERSION, updated_at: Date.now() };
           for (const zone of ZONES) {
-            await writeAtomic(path.join(dir, zoneFile(zone)), stringifyJsonl(zones[zone]));
+            const text = stringifyJsonl(zones[zone]);
+            await writeAtomic(path.join(dir, zoneFile(zone)), text);
+            lastWritten.set(zone, text);
           }
           await writeAtomic(
             path.join(dir, META_FILE),
@@ -483,6 +509,75 @@ export function createStore(opts) {
     /** 等所有挂起的写盘落定（导出前要用）。 */
     async flush() {
       await writeChain;
+    },
+
+    /**
+     * 盯着自己的 jsonl：**别人改了盘就重读**。
+     *
+     * 用 mtime+size 轮询，不用 fs.watch —— watcher 在 Windows 上会吊住进程
+     * （测试跑不完），而且落盘是「删 + 改名」的原子替换，事件语义还乱。
+     * 只认「磁盘内容 ≠ 上次自己写的内容」；自己写盘会更新 `lastWritten`，
+     * 所以不会自激。2 秒一轮、只 stat 三个小文件。
+     *
+     * @param {() => void} [onChange] 重读之后回调（宿主拿它清渲染缓存 + 记日志）
+     * @returns {() => void} 停止监听
+     */
+    watchExternal(onChange) {
+      if (watchStop !== null) return watchStop;
+
+      const check = async () => {
+        if (checking) return; // 上一轮还没读完
+        checking = true;
+        try {
+          let dirty = false;
+          for (const zone of ZONES) {
+            const file = path.join(dir, zoneFile(zone));
+            let st;
+            try {
+              st = await fsp.stat(file);
+            } catch {
+              continue; // 正在被原子替换的瞬间 → 下一轮再说
+            }
+            const sig = `${st.mtimeMs}:${st.size}`;
+            if (lastStat.get(zone) === sig) continue;
+            lastStat.set(zone, sig);
+            let text = '';
+            try {
+              text = await fsp.readFile(file, 'utf8');
+            } catch {
+              continue;
+            }
+            if (text !== lastWritten.get(zone)) dirty = true;
+          }
+          if (!dirty) return;
+          if (loaded) await store.reload();
+          else await store.load();
+          if (typeof onChange === 'function') onChange();
+        } catch (err) {
+          warn(`外部改动重读失败：${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+          checking = false;
+        }
+      };
+
+      // 先记一遍基线，否则第一次轮询会把「本来就是这些文件」当成外部改动
+      for (const zone of ZONES) {
+        try {
+          const st = statSync(path.join(dir, zoneFile(zone)));
+          lastStat.set(zone, `${st.mtimeMs}:${st.size}`);
+        } catch {
+          /* 文件还没建出来 */
+        }
+      }
+
+      pollTimer = setInterval(() => void check(), 2000);
+      if (typeof pollTimer.unref === 'function') pollTimer.unref();
+      watchStop = () => {
+        if (pollTimer !== null) clearInterval(pollTimer);
+        pollTimer = null;
+        watchStop = null;
+      };
+      return watchStop;
     },
 
     /** 给导出/调试用的一份纯数据快照。 */
