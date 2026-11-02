@@ -1697,7 +1697,7 @@ export function apply(ctx, rawConfig) {
 
   const abort = new AbortController();
 
-  /** @type {Map<string, {turn:number,lastWriteTurn:number,lastUserText:string,transcript:{role:'user'|'assistant',text:string}[],renderCache:{turn:number,text:string},queued:boolean}>} */
+  /** @type {Map<string, {turn:number,lastWriteTurn:number,lastUserText:string,transcript:{role:'user'|'assistant',text:string}[],renderCache:{turn:number,text:string},frozenText:(string|undefined),queued:boolean}>} */
   const sessionStates = new Map();
 
   function stateOf(sessionId) {
@@ -1709,6 +1709,8 @@ export function apply(ctx, rawConfig) {
         lastUserText: '',
         transcript: [],
         renderCache: { turn: -1, text: '' },
+        /** 本会话第一次成功渲染的注入文本，之后永不重算（会话级冻结） */
+        frozenText: undefined,
         queued: false,
         /** 上一轮列过候选、这一轮他点了某条时，挂着那一条，下一次渲染只读它 */
         confirmedRecall: null,
@@ -1842,6 +1844,27 @@ export function apply(ctx, rawConfig) {
   function renderForInner(agentId) {
     if (!ready || degraded || !config.enabled) return '';
     const s = stateOf(agentId);
+
+    /*
+     * ── 会话内冻结（2026-11-02 用户要求）────────────────────────────
+     *
+     * 一个会话**只渲染一次**：第一次成功渲染的文本存进 `frozenText`，
+     * 之后这个会话的每一轮都原样返回它，不再看库、不再跑召回。
+     *
+     * 为什么：注入段在 system prompt 里，它一变，后面整段静态内容 + 全部
+     * 对话历史全部失配 —— provider 的前缀缓存直接从这一句开始断。
+     * 实测（session-764385d6，95 轮）：memory search 每轮注入时命中率 1~2%，
+     * 同一轮内多 step 因为文本不变则是 97~99%。会话级冻结把那 97~99% 变成常态。
+     *
+     * 语义上这也是"像人"的：一个对话里不会每句话都重新想起一批旧事，
+     * 开局想起来的就是这些，剩下的靠对话上下文，真想不起来的再去搜。
+     *
+     * 冻结粒度刻意放在 renderForInner 里面而不是靠 renderCache.turn：
+     * 后者被 `invalidateRender` 在写盘/删除/压缩后清过二十多处，
+     * 靠它做不到"整个会话只注入一次"——每两轮固化写一次盘就全废了。
+     */
+    if (typeof s.frozenText === 'string' && s.confirmedRecall == null) return s.frozenText;
+
     if (s.renderCache.turn === s.turn) return s.renderCache.text;
 
     let text = '';
@@ -1891,6 +1914,11 @@ export function apply(ctx, rawConfig) {
     }
 
     s.renderCache = { turn: s.turn, text };
+
+    // 只在**真的渲染出内容**时冻结。空串通常是还没 ready、库是空的、
+    // 或者这一轮渲染抛错 —— 那种情况留到下一轮再试，
+    // 否则一次抖动就把整个会话钉死在"没有记忆"上。
+    if (text !== '') s.frozenText = text;
     return text;
   }
 
