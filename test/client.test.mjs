@@ -677,22 +677,22 @@ const tokenPayload = () =>
           key: 'shortCapacity',
           type: 'number',
           min: 5,
-          max: 2000,
+          max: 80000,
           step: 1,
-          label: '短期容量上限（条）',
-          default: 120,
-          value: 120,
+          label: '短期容量上限（条，5–8 万）',
+          default: 30000,
+          value: 30000,
           overridden: false,
         },
         {
           key: 'totalTokenCapacity',
           type: 'number',
           min: 5000,
-          max: 300000,
+          max: 10000000000,
           step: 1000,
-          label: '全库总量上限（token，渲染口径，最多 30 万）',
-          default: 100000,
-          value: 100000,
+          label: '全库总量上限（token，渲染口径，默认 10 亿、最多 100 亿）',
+          default: 1000000000,
+          value: 1000000000,
           overridden: false,
         },
         {
@@ -766,14 +766,14 @@ test('client: 调整窗口默认收起，展开后有输入框 + token 开销说
 
   const out = textOf(tree);
   assert.match(out, /1\.8 字 = 1 token/, 'token 开销要说清楚');
-  assert.match(out, /300K 是硬顶/);
+  assert.match(out, /总量硬顶 100 亿 token/);
   assert.match(out, /注入预算/, '必须说清「库大 ≠ 每轮都贵」');
   assert.match(out, /_archive/, '要说清压缩不是删除');
   assert.match(out, /settings\.json/, '要说清这些值存在哪');
 
   // 改总量 → 保存
   const target = inputs.find(
-    (n) => n.props['aria-label'] === '全库总量上限（token，渲染口径，最多 30 万）',
+    (n) => n.props['aria-label'] === '全库总量上限（token，渲染口径，默认 10 亿、最多 100 亿）',
   );
   assert.ok(target, '总量上限的输入框要在');
   target.props.onChange({ target: { value: '200000' } });
@@ -834,7 +834,7 @@ test('client: 镜像目录是字符串字段，填路径照样能保存（不会
   // 关键：一次保存里混着数字和路径 —— 正是用户踩到的那一下
   box.props.onChange({ target: { value: 'E:\\Backups\\memory' } });
   tree = renderNow(panel, react);
-  labeled(tree, '全库总量上限（token，渲染口径，最多 30 万）').props.onChange({ target: { value: '200000' } });
+  labeled(tree, '全库总量上限（token，渲染口径，默认 10 亿、最多 100 亿）').props.onChange({ target: { value: '200000' } });
   tree = renderNow(panel, react);
 
   tree = await clickAndSettle(panel, react, buttonByText(tree, '保存'));

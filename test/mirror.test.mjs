@@ -17,10 +17,10 @@ import {
   renderRestoreCmd,
   renderRestorePs1,
 } from '../src/core/mirror.mjs';
-import { CONFIG_DEFAULTS, TUNABLE_KEYS, resolveConfig } from '../src/core/config.mjs';
+import { CONFIG_DEFAULTS, MIRROR_DIR_DEFAULT_NAME, TUNABLE_KEYS, resolveConfig, resolveMirrorDir } from '../src/core/config.mjs';
 
-const DATA = 'C:\\dsh\\ebbinghaus-memory';
-const HOME = 'C:\\dsh';
+const DATA = 'D:\\data\\ebbinghaus-memory';
+const HOME = 'D:\\data';
 
 /* ─────────────────── 目录安全 ─────────────────── */
 
@@ -40,11 +40,11 @@ test('isSafeMirrorDir: 镜像就是库目录、或互相嵌套，都拒绝', () 
   // 镜像在库里
   assert.equal(isSafeMirrorDir(path.join(DATA, 'mirror'), DATA).ok, false);
   // 库在镜像里
-  assert.equal(isSafeMirrorDir('C:\\dsh', DATA).ok, false);
+  assert.equal(isSafeMirrorDir('D:\\data', DATA).ok, false);
 });
 
 test('isSafeMirrorDir: 大小写和结尾斜杠不影响判断', () => {
-  assert.equal(isSafeMirrorDir('c:\\DSH\\EBBINGHAUS-MEMORY\\', DATA).ok, false);
+  assert.equal(isSafeMirrorDir('d:\\DATA\\EBBINGHAUS-MEMORY\\', DATA).ok, false);
 });
 
 /* ─────────────────── 清单规划 ─────────────────── */
@@ -182,11 +182,27 @@ test('renderRestorePs1: 目录走合并复制（直接 Copy-Item 目录会套一
 
 /* ─────────────────── 配置 ─────────────────── */
 
-test('配置默认值：镜像默认关、每 5 条同步、目录留空', () => {
-  assert.equal(CONFIG_DEFAULTS.mirrorEnabled, false);
+test('配置默认值：镜像默认开、每 5 条同步、目录留空 = 桌面自动推导', () => {
+  assert.equal(CONFIG_DEFAULTS.mirrorEnabled, true);
   assert.equal(CONFIG_DEFAULTS.mirrorEveryEntries, 5);
   assert.equal(CONFIG_DEFAULTS.mirrorDir, '');
   assert.equal(CONFIG_DEFAULTS.mirrorExtraPaths, '');
+});
+
+test('resolveMirrorDir：留空落到当前用户桌面，填了就用填的，拿不到主目录才空', () => {
+  assert.equal(
+    resolveMirrorDir('', 'C:/Users/alice'),
+    `C:/Users/alice/Desktop/${MIRROR_DIR_DEFAULT_NAME}`,
+  );
+  assert.equal(
+    resolveMirrorDir('', 'C:/Users/alice/'),
+    `C:/Users/alice/Desktop/${MIRROR_DIR_DEFAULT_NAME}`,
+    '主目录末尾带斜杠不该出现双斜杠',
+  );
+  assert.equal(resolveMirrorDir('D:/MyBackup', 'C:/Users/alice'), 'D:/MyBackup', '填了就用填的');
+  assert.equal(resolveMirrorDir('  D:/MyBackup  ', 'C:/Users/alice'), 'D:/MyBackup', '两边空白要吃掉');
+  assert.equal(resolveMirrorDir('', ''), '', '拿不到主目录就不备份，不许猜');
+  assert.equal(resolveMirrorDir(123, ''), '', '坏类型当没填');
 });
 
 test('配置钳制：每 N 条卡在 1~50，目录写错类型退回空串', () => {

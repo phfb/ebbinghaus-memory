@@ -40,6 +40,7 @@ import {
   applyOverrides,
   buildSchema,
   resolveConfig,
+  resolveMirrorDir,
   tunableFields,
 } from '../core/config.mjs';
 import { createUpdater, normalizeRepoSlug, readLocalVersion } from './self-update.mjs';
@@ -2204,9 +2205,23 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /**
+   * 镜像根目录 —— **所有读 `config.mirrorDir` 的地方都必须走这里**。
+   *
+   * 留空 = 当前用户桌面的 DSHmemoryBackup（core/config.mjs 的 resolveMirrorDir）。
+   * 为什么统一：面板、安全校验、真同步各自 `String(config.mirrorDir).trim()` 一次，
+   * 早晚会变成「面板显示一个路径，实际往另一个地方写」—— 备份全靠猜，最坏的那种坏。
+   *
+   * @returns {string} 绝对路径；连主目录都拿不到时是 ''（= 不备份）
+   */
+  function mirrorRoot() {
+    const dir = resolveMirrorDir(config.mirrorDir, homedir());
+    return dir === '' ? '' : path.resolve(dir);
+  }
+
   /** 某个分区在镜像里的备份目录（`<mirrorDir>/<spaceId>/library`）。 */
   function mirrorPartitionDir(spaceId) {
-    const dir = typeof config.mirrorDir === 'string' ? config.mirrorDir.trim() : '';
+    const dir = mirrorRoot();
     if (dir === '') return '';
     return path.join(dir, spaceId, 'library');
   }
@@ -3239,8 +3254,12 @@ export function apply(ctx, rawConfig) {
    * @returns {Promise<{ok:boolean, files?:number, bytes?:number, dir?:string, reason?:string}>}
    */
   async function runMirrorNow(trigger) {
-    const dir = String(config.mirrorDir ?? '').trim();
-    const root = path.resolve(dir);
+    const root = mirrorRoot();
+    if (root === '') {
+      mirrorState = { ...mirrorState, lastOk: false, lastError: '没配镜像目录（mirrorDir 是空的，也拿不到用户主目录）' };
+      writeMirrorState(dataDir, mirrorState);
+      return { ok: false, reason: mirrorState.lastError };
+    }
     // 安全校验拿「当前激活分区」当锚点，保证不会往记忆库自己身上盖
     const safe = isSafeMirrorDir(path.join(root, activeSpaceId), dataDir);
     if (!safe.ok) {
@@ -3385,8 +3404,7 @@ export function apply(ctx, rawConfig) {
   async function noteMirror(added) {
     const n = Math.round(Number(added) || 0);
     if (n > 0) mirrorState.entriesSinceMirror = (Number(mirrorState.entriesSinceMirror) || 0) + n;
-    const ready =
-      config.mirrorEnabled === true && String(config.mirrorDir ?? '').trim() !== '';
+    const ready = config.mirrorEnabled === true && mirrorRoot() !== '';
     if (!ready) {
       if (n > 0) writeMirrorState(dataDir, mirrorState);
       return null;
@@ -3400,7 +3418,7 @@ export function apply(ctx, rawConfig) {
 
   /** 面板要的镜像状态。**只在这里拼一份** —— 两处各拼一次早晚会不一致。 */
   function mirrorPanelState() {
-    const dir = String(config.mirrorDir ?? '').trim();
+    const dir = mirrorRoot();
     const safe = isSafeMirrorDir(dir, dataDir);
     return {
       enabled: Boolean(config.mirrorEnabled),

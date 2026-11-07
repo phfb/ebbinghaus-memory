@@ -41,7 +41,9 @@ export const CONFIG_SPEC = [
   { key: 'longDays', type: 'number', default: 28, min: 2, max: 365, step: 1, label: '长期记忆周期（天）' },
 
   // ── 写入频率 ─────────────────────────────────────────────────────
-  { key: 'writeEveryTurns', type: 'number', default: 2, min: 1, max: 30, step: 1, label: '每几轮对话固化一次（1-30 轮，会话第一轮必写）· 频率越高越费 Token' },
+  // 2026-11-07：默认 2 → 4（沿用本机在用的设置）。固化一次要调一次模型，
+  // 2 轮一写在小库上没感觉，条数上限放宽到几万条之后就是纯粹的浪费。
+  { key: 'writeEveryTurns', type: 'number', default: 4, min: 1, max: 30, step: 1, label: '每几轮对话固化一次（1-30 轮，会话第一轮必写）· 频率越高越费 Token' },
   // 哪些 source.kind 算「他亲手打的字」。
   // 这不只是洁癖：别的桥接插件（其它 QQ 框架 / Telegram / Discord / 自建客户端）
   // 用的 kind 各不相同，写死就会**一条都记不上而且不报错**，症状跟坏了没法区分。
@@ -60,18 +62,25 @@ export const CONFIG_SPEC = [
   { key: 'minIntervalSeconds', type: 'number', default: 0, min: 0, max: 900, step: 5, label: '两次固化最小间隔（秒）· 0 = 不限制；调大能降频省额度' },
 
   // ── 分区容量（条），超了就回滚压缩 ────────────────────────────────
-  { key: 'shortCapacity', type: 'number', default: 120, min: 5, max: 2000, step: 1, label: '短期容量上限（条）' },
-  { key: 'longCapacity', type: 'number', default: 600, min: 5, max: 4000, step: 1, label: '长期容量上限（条）' },
-  { key: 'permanentCapacity', type: 'number', default: 1000, min: 5, max: 8000, step: 1, label: '永久容量上限（条）' },
+  // 2026-11-07：三档一起放大到「万条」级别（用户定的）。
+  //   短期 5–80k、长期 5–80k、永久 5–100k；默认 30k / 40k / 50k。
+  // 旧范围（2000 / 4000 / 8000）是按「一晚上聊几十条」估的，装不下几年积累；
+  // 而且条数上限一放宽，下面的全库 token 闸必须同步放大，否则条数才用掉 1%
+  // 就被体积闸按回压缩 —— 两道闸会互相打架，用户看到的就是「怎么老在压缩」。
+  { key: 'shortCapacity', type: 'number', default: 30000, min: 5, max: 80000, step: 1, label: '短期容量上限（条，5–8 万）' },
+  { key: 'longCapacity', type: 'number', default: 40000, min: 5, max: 80000, step: 1, label: '长期容量上限（条，5–8 万）' },
+  { key: 'permanentCapacity', type: 'number', default: 50000, min: 5, max: 100000, step: 1, label: '永久容量上限（条，5–10 万）' },
 
   // ── 全库总量（token）：把每一条按**注入格式**渲染成文字后的合计 ──────────
   // 计数口径与注入一致：`renderEntryLine()` 出来的那一行，中文按 1.8 字 ≈ 1 token
   // 估（SPEC §11 同一个系数，两处必须一致，否则面板显示 40K、注入按另一套算）。
   //
-  // 为什么要有第二道闸：条数上限管不住体积 —— 永久区 1000 条里只要混进几条
-  // 三千字的旧档案，条数才用掉 5%，检索和面板就已经在拖了。300000 是硬顶
-  // （用户定的），超过这个数浏览器里滚面板都费劲，曲线也失去意义。
-  { key: 'totalTokenCapacity', type: 'number', default: 100000, min: 5000, max: 300000, step: 1000, label: '全库总量上限（token，渲染口径，最多 30 万）' },
+  // 为什么要有第二道闸：条数上限管不住体积 —— 永久区混进几条三千字的旧档案，
+  // 条数才用掉一点点，检索和面板就已经在拖了。
+  // 2026-11-07：硬顶 300000 → 100 亿（10_000_000_000），默认 100000 → 10 亿。
+  // 十万条规模的库按注入格式渲染就是几亿 token 量级，旧硬顶会让新条数上限
+  // 完全用不上（写满 1% 就开始回收）。面板曲线按比例算，上限抬高不影响读数。
+  { key: 'totalTokenCapacity', type: 'number', default: 1000000000, min: 5000, max: 10000000000, step: 1000, label: '全库总量上限（token，渲染口径，默认 10 亿、最多 100 亿）' },
 
   // ── 分区强度：越深越模糊 ─────────────────────────────────────────
   { key: 'shortDetail', type: 'number', default: 0.9, min: 0.1, max: 1, step: 0.05, label: '短期记忆强度（详细度）' },
@@ -79,18 +88,21 @@ export const CONFIG_SPEC = [
   { key: 'permanentDetail', type: 'number', default: 0.3, min: 0.1, max: 1, step: 0.05, label: '永久记忆强度（详细度）' },
 
   // ── 载入策略 ─────────────────────────────────────────────────────
-  { key: 'loadShortCount', type: 'number', default: 14, min: 0, max: 300, step: 1, label: '每轮载入短期几条' },
+  // 2026-11-07：载入条数按本机在用的值上调（14/10/10/20 → 20/15/15/16）。
+  // 条数上限放宽之后，注入条数太少会显得「记得很多、想起来的很少」。
+  { key: 'loadShortCount', type: 'number', default: 20, min: 0, max: 300, step: 1, label: '每轮载入短期几条' },
   // 2026-10-28：长期从「随机忆起」改成「近 N 天内权重最高的」。键名保留是为了不炸老 settings.json。
-  { key: 'loadLongRandom', type: 'number', default: 10, min: 0, max: 300, step: 1, label: '每轮载入长期几条（近 N 天内权重最高的）' },
+  { key: 'loadLongRandom', type: 'number', default: 15, min: 0, max: 300, step: 1, label: '每轮载入长期几条（近 N 天内权重最高的）' },
   { key: 'loadLongWindowDays', type: 'number', default: 60, min: 1, max: 365, step: 1, label: '长期只在最近几天内挑（默认 60 天）' },
-  { key: 'loadPermanentCount', type: 'number', default: 10, min: 0, max: 300, step: 1, label: '每轮载入永久几条（一级：权重最高）' },
+  { key: 'loadPermanentCount', type: 'number', default: 15, min: 0, max: 300, step: 1, label: '每轮载入永久几条（一级：权重最高）' },
   // 2026-10-28：永久区分两级注入。
   // 一级 = 权重最高的那几条（「我是谁」这种铁律，必须每轮都在）；
   // 二级 = 从剩下的里随机抽，优先抽「离现在 ≥ loadPermanentSecondaryDays 天」的老记忆，
   //        老的不够就从剩余部分随机补 —— 否则越老的东西永远进不了注入。
-  { key: 'loadPermanentSecondaryCount', type: 'number', default: 20, min: 0, max: 300, step: 1, label: '每轮载入永久几条（二级：老的随机）' },
+  { key: 'loadPermanentSecondaryCount', type: 'number', default: 16, min: 0, max: 300, step: 1, label: '每轮载入永久几条（二级：老的随机）' },
   { key: 'loadPermanentSecondaryDays', type: 'number', default: 60, min: 1, max: 730, step: 1, label: '二级只抽多少天以前的（按时间戳间隔算）' },
-  { key: 'budgetTokens', type: 'number', default: 3500, min: 200, max: 8000, step: 1, label: '注入预算（token）· 每轮聊天都会带上这段，调大同时增加聊天输入花费' },
+  // 2026-11-07：3500 → 4000（本机在用的值）。
+  { key: 'budgetTokens', type: 'number', default: 4000, min: 200, max: 8000, step: 1, label: '注入预算（token）· 每轮聊天都会带上这段，调大同时增加聊天输入花费' },
 
   // ── 升级 / 淘汰门槛 ──────────────────────────────────────────────
   { key: 'promoteShortToLong', type: 'number', default: 0.55, min: 0, max: 1, step: 0.05, label: '短期→长期的权重门槛' },
@@ -128,9 +140,10 @@ export const CONFIG_SPEC = [
     // 0.5 是拿真库调出来的：183 条上能抓同一件事的不同写法（「林小满：四川人，
     // 在杭州工作」三种说法、「雷区：不在群里提他的薪资」两种），
     // 又不会把「同一天发生的两件事」揉成一条。调高更保守，调低更主动。
+    // 2026-11-07：0.65 → 0.5（本机在用的值，也是上面这段原本实测出来的那个数）。
     key: 'dedupThreshold',
     type: 'number',
-    default: 0.65,
+    default: 0.5,
     min: 0.3,
     max: 0.95,
     step: 0.05,
@@ -152,7 +165,9 @@ export const CONFIG_SPEC = [
   // 连续失败到阈值就把固化临时切到官方模型，存成功一次算「好了」，
   // 再切回聊天模型。切回后先稳定一段冷静期才重新计数，免得来回抖。
   { key: 'fallbackEnabled', type: 'boolean', default: true, label: '固化连续失败就临时切到官方模型 · 存成功一次后自动切回聊天模型' },
-  { key: 'fallbackAfter', type: 'number', default: 3, min: 2, max: 10, step: 1, label: '连续失败几次切链路（2-10 次）· 越小越早切、也越容易被误判' },
+  // 2026-11-07：默认 3 → 5（本机在用的值）。3 次太容易误判 —— 碰上模型偶尔
+  // 吐一段带 markdown 围栏的 JSON 就会白切一次链路，切过去又切回来更费钱。
+  { key: 'fallbackAfter', type: 'number', default: 5, min: 2, max: 10, step: 1, label: '连续失败几次切链路（2-10 次）· 越小越早切、也越容易被误判' },
   { key: 'fallbackProvider', type: 'string', default: 'deepseek-account', label: '兜底 provider（官方）' },
   { key: 'fallbackModel', type: 'string', default: 'deepseek-flash', label: '兜底模型（官方）' },
   { key: 'fallbackCooldownSeconds', type: 'number', default: 600, min: 60, max: 7200, step: 60, label: '切回聊天模型后的冷静期（秒）· 期间不再判定失败' },
@@ -164,7 +179,10 @@ export const CONFIG_SPEC = [
   // 备份内容：记忆库全部文件 + DSH 人格提示词（AGENT.md / prompt-inject.md）
   // + 其它插件配置（靠 mirrorExtraPaths 手动列，见 README）。
   // 刻意不带 node_modules / 插件源码 / exe —— 那些重装一份就好，塞进来只会让镜像变胖。
-  { key: 'mirrorEnabled', type: 'boolean', default: false, label: '自动备份镜像（记忆 + 人格提示词 + 插件配置）' },
+  // 2026-11-07：默认开启（本机一直在用），目录默认落到**当前用户桌面**的
+  // DSHmemoryBackup（见 resolveMirrorDir）。换机器、换用户名都跟着走，
+  // 不用再把某台机器的绝对路径写死进默认值。
+  { key: 'mirrorEnabled', type: 'boolean', default: true, label: '自动备份镜像（记忆 + 人格提示词 + 插件配置）' },
   {
     key: 'mirrorEveryEntries',
     type: 'number',
@@ -178,7 +196,7 @@ export const CONFIG_SPEC = [
     key: 'mirrorDir',
     type: 'string',
     default: '',
-    label: '镜像目录（绝对路径；留空 = 不备份）',
+    label: '镜像目录（绝对路径；留空 = 当前用户桌面的 DSHmemoryBackup）',
   },
   {
     key: 'mirrorExtraPaths',
@@ -194,6 +212,31 @@ export const CONFIG_SPEC = [
 export const CONFIG_DEFAULTS = Object.freeze(
   Object.fromEntries(CONFIG_SPEC.map((f) => [f.key, f.default])),
 );
+
+/** 镜像目录留空时，落到桌面下的这个目录名。 */
+export const MIRROR_DIR_DEFAULT_NAME = 'DSHmemoryBackup';
+
+/**
+ * 解析镜像根目录。
+ *
+ * **纯字符串运算，不碰 fs** —— 客户端也能调，测试也好写。
+ *
+ * 2026-11-07 起，「留空」不再等于「不备份」：默认落到
+ * `<当前用户桌面>/DSHmemoryBackup`，换机器、换用户名都跟着走，
+ * 不用把某台机器的绝对路径写死进默认值。
+ * 要真的关掉备份用 `mirrorEnabled: false`（面板上那个总开关）。
+ *
+ * @param {unknown} raw       `config.mirrorDir`
+ * @param {string}  [homeDir] 用户主目录（host 传 `os.homedir()`）
+ * @returns {string} 绝对路径；连主目录都拿不到时返回 ''（= 不备份）
+ */
+export function resolveMirrorDir(raw, homeDir) {
+  const dir = typeof raw === 'string' ? raw.trim() : '';
+  if (dir !== '') return dir;
+  const home = typeof homeDir === 'string' ? homeDir.trim() : '';
+  if (home === '') return '';
+  return `${home.replace(/[\\/]+$/, '')}/Desktop/${MIRROR_DIR_DEFAULT_NAME}`;
+}
 
 function coerce(field, value) {
   if (value === undefined || value === null) return field.default;

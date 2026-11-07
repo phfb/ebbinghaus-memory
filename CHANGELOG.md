@@ -12,6 +12,73 @@ node tools/check-patch-yaml.mjs
 
 ---
 
+## [1.3.0] - 2026-11-07
+
+### 改：容量闸整体放大（条数到万级，总量到十亿级）
+
+**他的要求**：三档容量允许范围改成「短期 5–80k、长期 5–80k、永久 5–100k」，
+默认值 30k / 40k / 50k；全库总量上限 100 亿 token、默认 10 亿。
+
+**为什么必须一起改**：两道闸是串行的。条数上限放到几万条，总量上限还停在 30 万，
+条数才用掉 1% 体积闸就先按回去 —— 用户看到的症状是「明明还有地方，怎么老在压缩」。
+所以这次四个数一起动：
+
+| 键 | 旧 | 新 |
+|---|---|---|
+| `shortCapacity` | 120（5–2000） | **30000**（5–80000） |
+| `longCapacity` | 600（5–4000） | **40000**（5–80000） |
+| `permanentCapacity` | 1000（5–8000） | **50000**（5–100000） |
+| `totalTokenCapacity` | 100000（硬顶 300000） | **1000000000**（硬顶 10000000000） |
+
+`budget.mjs` 的 `TOTAL_CAPACITY_MAX / DEFAULT` 同步改；两处不一致会让「面板能调 10 亿、
+实际按 30 万在压」，所以测试里也钉了它们与 `CONFIG_SPEC` 同源。
+
+### 改：默认值改成「本机已应用设置」的那一套
+
+不是凭空调数字，是把这台机器上真在用的 `settings.json` 抽成首次安装的起点：
+
+| 键 | 旧默认 | 新默认 | 来源 |
+|---|---|---|---|
+| `writeEveryTurns` | 2 | 4 | 本机在用的值 |
+| `loadShortCount` | 14 | 20 | 同上 |
+| `loadLongRandom` | 10 | 15 | 同上 |
+| `loadPermanentCount` | 10 | 15 | 同上 |
+| `loadPermanentSecondaryCount` | 20 | 16 | 同上（工作分区） |
+| `budgetTokens` | 3500 | 4000 | 同上 |
+| `dedupThreshold` | 0.65 | 0.5 | 同上（也是当初实测出来的那个数） |
+| `fallbackAfter` | 3 | 5 | 同上（3 次太容易误判） |
+| `mirrorEnabled` | false | true | 同上 |
+
+本机路径（`dataDir`、QQ 号、`mirrorExtraPaths` 里的 bot data 目录）**一律不进默认值** ——
+那些是这台机器的坐标，写进代码只会让换机器时更难查。
+
+### 改：镜像目录默认落到「当前用户桌面 / DSHmemoryBackup」
+
+- 新增 `resolveMirrorDir(raw, homeDir)`（`core/config.mjs`）：`mirrorDir` 留空时返回
+  `<主目录>/Desktop/DSHmemoryBackup`，换机器、换用户名都跟着走。
+- host 里新增 `mirrorRoot()`，**所有**读 `config.mirrorDir` 的地方都走它（面板、安全校验、
+  真同步）。之前四处各写一次 `String(...).trim()`，早晚会「面板显示一个路径、实际往另一个写」。
+- 语义变化：「留空」不再等于「不备份」。要关备份用 `mirrorEnabled: false`。
+  面板 placeholder、README、yml 注释都跟着改。
+- 拿不到主目录时仍然返回 `''`（= 不备份），不猜。
+
+### 修：注入渲染的兜底数字不再写死
+
+`renderInjection()` 里 `budget 1400 / 短期 12 / 长期 3 / 永久 3` 的兜底改成取
+`CONFIG_DEFAULTS`。「cfg 缺字段」和「没配置」渲染出两种注入量、还都算正常，这种坑
+AGENTS.md 第 20 条已经记过一次。
+
+### 改：面板 token 缩写补 M / B 两档
+
+`fmtTokens` 原来只缩到 K —— 10 亿会显示成「10000000K」。现在 1000000000 → `1B`。
+
+### 测试
+
+`node --test` 345 条全过。新增 `resolveMirrorDir` 的 6 条断言；改了三条跟着旧硬顶
+（300000）和旧镜像默认（关）走的断言。
+
+---
+
 ## [1.2.0] - 2026-11-02
 
 ### 改：注入改成「一个会话只渲染一次」—— 会话级冻结

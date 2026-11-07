@@ -1045,10 +1045,10 @@ test('面板设置：改容量当场生效、落 settings.json、白名单外拒
   assert.equal(g.settings.overridden, false, '新库没有覆盖层');
   const tokenField = g.settings.fields.find((f) => f.key === 'totalTokenCapacity');
   assert.ok(tokenField, '总量上限必须出现在可调字段里');
-  assert.equal(tokenField.max, 300000, '硬顶 300K');
-  assert.equal(tokenField.value, 100000);
+  assert.equal(tokenField.max, 10000000000, '硬顶 100 亿');
+  assert.equal(tokenField.value, 1000000000);
   const capField = g.settings.fields.find((f) => f.key === 'shortCapacity');
-  assert.ok(capField && capField.max >= 2000, '条数上限也要能调');
+  assert.ok(capField && capField.max >= 80000, '条数上限也要能调（5–8 万）');
   assert.equal(typeof g.tokens.total, 'number', 'state / settings 都带总量');
 
   // ── POST：改两个数 ──
@@ -1091,8 +1091,8 @@ test('面板设置：改容量当场生效、落 settings.json、白名单外拒
   const resClamp = fakeRes();
   await h
     .route('/ebbinghaus/settings')
-    .handler(fakeReq({ method: 'POST', body: { totalTokenCapacity: 999999 } }), resClamp);
-  assert.equal(resClamp.json().tokens.capacity, 300000, '超过 300K 一律按住');
+    .handler(fakeReq({ method: 'POST', body: { totalTokenCapacity: 10000000001 } }), resClamp);
+  assert.equal(resClamp.json().tokens.capacity, 10000000000, '超过 100 亿一律按住');
 
   // ── 重启（新实例读同一个目录）仍然生效 ──
   const h2 = makeCtx(makeLlm({ text: '' }));

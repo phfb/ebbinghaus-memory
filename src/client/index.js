@@ -124,17 +124,25 @@ window.__ModuleLoader__.load({
     const WIKI = [
       '条数上限管「每个区最多几条」。超了自动回滚压缩：最老的几条揉成一条更模糊的，原文进 _archive，随时能捞回来。',
       '总量上限管「整库渲染成上下文一共多少 token」（中文约 1.8 字 = 1 token）。超了自动回收最老、最不重要的那几条 —— 同样是压缩不是删除。',
-      '两道闸谁先到谁算数：条数没超、总量超了，一样会回收。300K 是硬顶。',
-      '真正的每轮 token 开销由「注入预算」决定（默认 1400），库里有 10 万字不等于每轮多花 10 万 —— 每次只有十几条进上下文。',
+      '两道闸谁先到谁算数：条数没超、总量超了，一样会回收。总量硬顶 100 亿 token。',
+      '真正的每轮 token 开销由「注入预算」决定（默认 4000），库里有几千万字不等于每轮多花几千万 —— 每次只有几十条进上下文。',
       '「记忆库自检」是第三道：每隔 N 条新记忆，把**说的是同一件事**的条目跨分区并成一条。它不注入对话、不调模型，纯本地跑，所以既不占上下文也不花钱；合并后细节留最全的那份，原文进 _archive。',
-      '库越大，检索、面板渲染、每次回收判断都会慢一点。日常聊 60K～100K 够用很久；把库当日志天天猛写再往上调。',
+      '库越大，检索、面板渲染、每次回收判断都会慢一点。日常聊几百万 token 够用很久；把库当日志天天猛写再往上调。',
       '「自动备份镜像」把记忆库全部文件 + AGENT.md / prompt-inject.md 同步到另一个目录，每写入 N 条同步一次。镜像目录里会有一个 恢复记忆.cmd，双击就能把这份备份写回去（会先问你，也会先把当前库备份一份）。',
       '镜像目录要填绝对路径，且不能和记忆库目录互相嵌套。想让它也带上其它插件的数据（比如 alive / qq-bot 的 data 目录），在「额外要镜像的路径」里一行写一个。',
     ];
 
-    /** token 数缩写：10400 → 10.4K，100000 → 100K。 */
+    /**
+     * token 数缩写：10400 → 10.4K，100000 → 100K，1000000000 → 1B。
+     *
+     * 2026-11-07：总量上限放到 100 亿之后，只缩到 K 会显示成「10000000K」，
+     * 七位数一眼看不出量级。补 M / B 两档，整数不带小数尾巴。
+     */
     function fmtTokens(n) {
       const v = num(n, 0);
+      const tail = (x, unit) => `${Number.isInteger(x) ? x : x.toFixed(1).replace(/\.0$/, '')}${unit}`;
+      if (v >= 1e9) return tail(v / 1e9, 'B');
+      if (v >= 1e6) return tail(v / 1e6, 'M');
       if (v >= 100000) return `${Math.round(v / 1000)}K`;
       if (v >= 1000) return `${(v / 1000).toFixed(1).replace(/\.0$/, '')}K`;
       return String(Math.round(v));
@@ -1023,7 +1031,7 @@ window.__ModuleLoader__.load({
                   type: 'text',
                   value: text,
                   'aria-label': f.label || f.key,
-                  placeholder: '绝对路径，比如 D:/mirror/ebbinghaus（留空 = 不备份）',
+                  placeholder: '绝对路径，比如 D:/mirror/ebbinghaus（留空 = 桌面\\DSHmemoryBackup）',
                   onChange: (ev) => props.onChange(f.key, ev && ev.target ? String(ev.target.value ?? '') : ''),
                   style: boxStyle,
                 }),
@@ -1558,7 +1566,7 @@ window.__ModuleLoader__.load({
           }
           // 字符串字段（镜像目录 / 额外路径）：值本来就是文本，路径过 Number()
           // 必然是 NaN，会被当成「填错了」把整次保存吞掉。而且这一格**空串是
-          // 有意义的**（"留空 = 不备份"），所以空也要提交 —— 只有数字字段才把
+          // 有意义的**（"留空 = 桌面默认"），所以空也要提交 —— 只有数字字段才把
           // 空当"没动"。
           if (field && field.type === 'string') {
             body[key] = String(raw ?? '').trim();

@@ -142,10 +142,14 @@ promoteLongToPermanent forgetBelow recallTop recallThreshold
 dedupEnabled dedupEveryEntries dedupThreshold
 provider model reasoningEffort maxTokens jobTimeoutMs debugLog`
 
-**默认值（2026-10-25 调整）**：`shortCapacity 120 / longCapacity 600 /
-permanentCapacity 1000`（用户嫌记得太少，全体上调）；`totalTokenCapacity 100000`
-（第二道闸，硬顶 300000）；`dedupEnabled true / dedupEveryEntries 30（5-100）/
-dedupThreshold 0.5`（第三道闸：自检去重）。
+**默认值（2026-11-07 调整）**：`shortCapacity 30000 / longCapacity 40000 /
+permanentCapacity 50000`（区间 5–80000 / 5–80000 / 5–100000，条数上限放到万级）；
+`totalTokenCapacity 1000000000`（第二道闸，默认 10 亿、硬顶 100 亿 —— 条数放大后
+体积闸必须同步，否则写满 1% 就被回压）；`writeEveryTurns 4`；`loadShortCount 20 /
+loadLongRandom 15 / loadPermanentCount 15 / loadPermanentSecondaryCount 16`；
+`budgetTokens 4000`；`dedupEnabled true / dedupEveryEntries 30（5-100）/
+dedupThreshold 0.5`（第三道闸：自检去重）；`mirrorEnabled true`，`mirrorDir` 留空表示
+「当前用户桌面 / DSHmemoryBackup」（`resolveMirrorDir()` 推导，不写死机器路径）。
 
 ### 4.1 面板可调键与运行时覆盖（冻结）
 
@@ -371,10 +375,10 @@ export function renderEntryLine(entry, { now, detailLimit }) -> string
 
 ```js
 export const TOTAL_CAPACITY_MIN = 5000
-export const TOTAL_CAPACITY_MAX = 300000
-export const TOTAL_CAPACITY_DEFAULT = 100000
+export const TOTAL_CAPACITY_MAX = 10000000000
+export const TOTAL_CAPACITY_DEFAULT = 1000000000
 
-export function totalCapacityOf(cfg) -> number        // 钳到 [5000, 300000]
+export function totalCapacityOf(cfg) -> number        // 钳到 [5000, 10000000000]
 export function estimateEntryTokens(entry, zone, cfg, now) -> number
 export function tokenUsage(zones, cfg, now)
   -> { total, capacity, ratio, over, left, byZone, count }

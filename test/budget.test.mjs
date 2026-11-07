@@ -49,17 +49,18 @@ function mk(o = {}) {
 
 /* ───────────────────────── 上限 ───────────────────────── */
 
-test('totalCapacityOf：默认 100K，坏值 100K，超顶钳到 300K，过小钳到 5K', () => {
+test('totalCapacityOf：默认 10 亿，坏值 10 亿，超顶钳到 100 亿，过小钳到 5K', () => {
   assert.equal(totalCapacityOf({}), TOTAL_CAPACITY_DEFAULT);
   assert.equal(totalCapacityOf({ totalTokenCapacity: 100000 }), 100000);
   assert.equal(totalCapacityOf({ totalTokenCapacity: 0 }), TOTAL_CAPACITY_DEFAULT);
   assert.equal(totalCapacityOf({ totalTokenCapacity: 'abc' }), TOTAL_CAPACITY_DEFAULT);
-  assert.equal(totalCapacityOf({ totalTokenCapacity: 999999 }), TOTAL_CAPACITY_MAX);
+  assert.equal(totalCapacityOf({ totalTokenCapacity: TOTAL_CAPACITY_MAX + 1000 }), TOTAL_CAPACITY_MAX);
+  assert.equal(totalCapacityOf({ totalTokenCapacity: TOTAL_CAPACITY_MAX * 100 }), TOTAL_CAPACITY_MAX);
   assert.equal(totalCapacityOf({ totalTokenCapacity: 10 }), TOTAL_CAPACITY_MIN);
   assert.equal(totalCapacityOf({ totalTokenCapacity: 60000.7 }), 60001);
 });
 
-test('配置里的默认值就是 100K，且不超过硬顶', () => {
+test('配置里的默认值就是 10 亿，且不超过硬顶', () => {
   assert.equal(cfg.totalTokenCapacity, TOTAL_CAPACITY_DEFAULT);
   assert.ok(cfg.totalTokenCapacity <= TOTAL_CAPACITY_MAX);
 });

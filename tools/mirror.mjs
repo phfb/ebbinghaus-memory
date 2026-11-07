@@ -9,7 +9,8 @@
  *   node tools/mirror.mjs --dir D:/mirror/ebbinghaus --apply      # 真写
  *   node tools/mirror.mjs --dir ... --apply --data D:/other-library --extra D:/plugin-data
  *
- * 不传 --dir 时，会去库目录的 settings.json 里读面板上填的那个镜像目录。
+ * 不传 --dir 时，会去库目录的 settings.json 里读面板上填的那个镜像目录；
+ * 那里也留空就用「当前用户桌面 / DSHmemoryBackup」（和插件里的默认一致）。
  *
  * ⚠️ 复制规则和 `src/host/index.mjs` 的 `runMirrorNow` 是同一套（都走 core/mirror.mjs 的
  *    planMirror）。改了一边记得看另一边 —— 清单本身有单测守着，不会悄悄漂。
@@ -19,6 +20,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFil
 import { homedir } from 'node:os';
 import path from 'node:path';
 
+import { resolveMirrorDir } from '../src/core/config.mjs';
 import {
   MANIFEST_FILE,
   RESTORE_CMD,
@@ -77,7 +79,8 @@ function mirrorDirFromSettings() {
 }
 
 const explicitDir = String(arg('--dir', '') ?? '').trim();
-const mirrorDir = explicitDir !== '' ? explicitDir : mirrorDirFromSettings();
+// 空 = 桌面默认（resolveMirrorDir），跟插件运行时同一套推导。
+const mirrorDir = resolveMirrorDir(explicitDir !== '' ? explicitDir : mirrorDirFromSettings(), homedir());
 
 if (mirrorDir === '') {
   console.error('没给镜像目录：加 --dir <目录>，或者先在面板里填好再跑。');

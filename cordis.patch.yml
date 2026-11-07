@@ -26,22 +26,24 @@
         # 长期同理：28 × 24 小时。
         longDays: 28
         # ── 写入频率 ─────────────────────────────────────────────
-        # 每多少次对话（回合）写一次记忆。1 = 每轮都写，2 = 隔一轮。
-        writeEveryTurns: 2
+        # 每多少次对话（回合）写一次记忆。1 = 每轮都写，4 = 每 4 轮写一次。
+        writeEveryTurns: 4
         # ── 分区容量（条）→ 超了就触发"回滚压缩" ───────────────────
-        # 2026-10-25：默认值 60/120/240 → 120/600/1000（用户嫌记得太少）。
+        # 2026-11-07：120/600/1000 → 30000/40000/50000（条数上限放到万级）。
         # 这些值在侧栏面板「调整容量」里也能改，改完存在 <库>/settings.json，
         # 优先级：面板覆盖值 > 这里 > 代码默认值。
-        shortCapacity: 120
-        longCapacity: 600
-        permanentCapacity: 1000
+        shortCapacity: 30000
+        longCapacity: 40000
+        permanentCapacity: 50000
         # ── 全库总量上限（token）→ 第二道闸 ──────────────────────
         # 口径：每一条按注入格式渲染成文字后合计，中文约 1.8 字 = 1 token。
         # 超了自动回收最老、权重最低的那几条（压缩不删除，原文进 _archive）。
-        # 上限 300000（硬顶）。怎么定这个数见 README「容量与 token 开销」。
+        # 2026-11-07：默认 10 亿（1000000000），硬顶 100 亿。
+        # 条数上限放到几万条之后，这道闸必须同步放大，否则写满 1% 就被回去压缩。
+        # 怎么定这个数见 README「容量与 token 开销」。
         # ⚠️ 它管的是"库里能囤多少"，不是"每轮花多少" —— 每轮只注入
-        #    budgetTokens（1400），库再大也不会每次聊天都变贵。
-        totalTokenCapacity: 100000
+        #    budgetTokens（4000），库再大也不会每次聊天都变贵。
+        totalTokenCapacity: 1000000000
         # ── 记忆库自检（重复记忆合并）────────────────────────────────
         # 固化那一刻模型看不到库里已有什么，同一件事会被反复记下来。
         # 自检负责事后打扫：跨分区把「说的是同一件事」的并成一条，
@@ -64,12 +66,14 @@
         longDetail: 0.55
         permanentDetail: 0.3
         # ── 载入策略（每轮注入）──────────────────────────────────
-        # 短期全载（上限）；长期随机取几条；永久只取一小部分。
-        loadShortCount: 12
-        loadLongRandom: 3
-        loadPermanentCount: 3
+        # 短期全载（上限）；长期近 N 天内权重最高的几条；永久分两级取。
+        loadShortCount: 20
+        loadLongRandom: 15
+        loadPermanentCount: 15
+        # 永久区二级注入：从剩下的里随机抽，优先抽老的
+        loadPermanentSecondaryCount: 16
         # 注入总预算（token），硬顶。超了从最不重要的开始裁。
-        budgetTokens: 1400
+        budgetTokens: 4000
         # ── 升级门槛（权重 0~1）─────────────────────────────────
         promoteShortToLong: 0.55
         promoteLongToPermanent: 0.7
@@ -86,7 +90,7 @@
         model: ''
         # 结构化抽取不需要思考，**保持 off**（跟随 high 会把 token 全烧在推理上）
         reasoningEffort: off
-        maxTokens: 1200
+        maxTokens: 4000
         # 后台任务超时（毫秒）
         jobTimeoutMs: 60000
         # 调试日志（只打形状，绝不落盘对话正文）

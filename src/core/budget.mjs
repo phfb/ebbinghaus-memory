@@ -15,10 +15,18 @@
 
 import { countTokens, detailLimitFor, renderEntryLine } from './render.mjs';
 
-/** 总量上限的钳制区间。300000 是硬顶（用户定的）。 */
+/**
+ * 总量上限的钳制区间。
+ *
+ * 2026-11-07：硬顶 300000 → 100 亿，默认 100000 → 10 亿。
+ * 三档条数上限放宽到「万条」以后，旧硬顶会在条数用掉 1% 时就触发回收压缩，
+ * 两道闸互相打架。这个区间必须跟 core/config.mjs 的 `totalTokenCapacity`
+ * 的 min/max/default 一致 —— 两处各写一套，早晚会「面板显示能调 10 亿，
+ * 实际按 30 万在压」。
+ */
 export const TOTAL_CAPACITY_MIN = 5000;
-export const TOTAL_CAPACITY_MAX = 300000;
-export const TOTAL_CAPACITY_DEFAULT = 100000;
+export const TOTAL_CAPACITY_MAX = 10000000000;
+export const TOTAL_CAPACITY_DEFAULT = 1000000000;
 
 /**
  * 回收时先动哪个区。

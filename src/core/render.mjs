@@ -12,6 +12,7 @@
  * 空区整段不出现（不写「（空）」），否则等于用 token 买一句「这里没有东西」。
  */
 
+import { CONFIG_DEFAULTS } from './config.mjs';
 import { detailFloor } from './schema.mjs';
 import { DAY_MS, stampFor } from './time.mjs';
 import { truncateDetail } from './compress.mjs';
@@ -223,18 +224,25 @@ export function renderInjection(p) {
   const zones = p?.zones ?? {};
   const cfg = p?.cfg ?? {};
   const now = Number.isFinite(p?.now) ? /** @type {number} */ (p.now) : Date.now();
+  // 兜底全部取 `CONFIG_DEFAULTS`，不在这里再写一份数字。
+  // 之前这里写死 1400 / 12 / 3 / 3，默认值一上调，「cfg 缺字段」和「没配置」
+  // 就会渲染出两种完全不同的注入量，还都算「正常」。
   const budget = Number.isFinite(p?.budgetTokens)
     ? Number(p.budgetTokens)
     : Number.isFinite(Number(cfg.budgetTokens))
       ? Number(cfg.budgetTokens)
-      : 1400;
+      : CONFIG_DEFAULTS.budgetTokens;
 
-  const shortDays = Number.isFinite(Number(cfg.shortDays)) ? Number(cfg.shortDays) : 7;
-  const loadShort = Number.isFinite(Number(cfg.loadShortCount)) ? Number(cfg.loadShortCount) : 12;
-  const loadLong = Number.isFinite(Number(cfg.loadLongRandom)) ? Number(cfg.loadLongRandom) : 3;
+  const shortDays = Number.isFinite(Number(cfg.shortDays)) ? Number(cfg.shortDays) : CONFIG_DEFAULTS.shortDays;
+  const loadShort = Number.isFinite(Number(cfg.loadShortCount))
+    ? Number(cfg.loadShortCount)
+    : CONFIG_DEFAULTS.loadShortCount;
+  const loadLong = Number.isFinite(Number(cfg.loadLongRandom))
+    ? Number(cfg.loadLongRandom)
+    : CONFIG_DEFAULTS.loadLongRandom;
   const loadPerm = Number.isFinite(Number(cfg.loadPermanentCount))
     ? Number(cfg.loadPermanentCount)
-    : 3;
+    : CONFIG_DEFAULTS.loadPermanentCount;
 
   /** 一条 entry → items 里的一行。这里统一决定 detail 上限与时间戳措辞。 */
   const toItem = (entry, zone) => ({
